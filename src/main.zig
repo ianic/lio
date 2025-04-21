@@ -13,27 +13,32 @@ pub fn main() !void {
     var loop = try Loop.init(16);
     defer loop.deinit();
 
-    // var fds = [_]posix.fd_t{-1} ** 4;
-    // try loop.ring.register_files(&fds);
     try loop.ring.register_files_sparse(4);
     // ako ih nema dovoljno dobijem: FileTableOverflow, // NFILE = 23 File table overflow
 
     var addr: net.Address = try std.net.Address.resolveIp("127.0.0.1", 9898);
-
-    const listen_fd: u32 = 2;
+    var listen_fd: posix.fd_t = 0;
     const yes_socket_option: u32 = 1;
     const yes = mem.asBytes(&yes_socket_option);
-    var cqes: [256]linux.io_uring_cqe = undefined;
-
+    var cqes: [4]linux.io_uring_cqe = undefined;
     assert(loop.ring.sq_ready() == 0);
 
-    _ = try loop.ring.socket_direct_alloc(99, addr.any.family, posix.SOCK.STREAM, 0, 0);
-    _ = try loop.ring.socket_direct_alloc(98, addr.any.family, posix.SOCK.STREAM, 0, 0);
+    _ = try loop.ring.socket_direct_alloc(1, addr.any.family, posix.SOCK.STREAM, 0, 0);
 
+    _ = try loop.ring.submit();
+    var n = try loop.ring.copy_cqes(&cqes, 1);
+    log.debug("cqes: {}", .{n});
+    for (cqes[0..n]) |cqe| {
+        log.debug("{}", .{cqe});
+        assert(cqe.res >= 0);
+        listen_fd = @intCast(cqe.res);
+    }
+
+    // ensure sqe ready capacity
     assert(loop.ring.sq.sqes.len - loop.ring.sq_ready() >= 5);
-    var sqe = try loop.ring.socket_direct(1, addr.any.family, posix.SOCK.STREAM, 0, 0, listen_fd);
-    sqe.flags |= linux.IOSQE_IO_LINK;
-    sqe = try loop.ring.setsockopt(2, listen_fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, yes);
+    // var sqe = try loop.ring.socket_direct(1, addr.any.family, posix.SOCK.STREAM, 0, 0, listen_fd);
+    // sqe.flags |= linux.IOSQE_IO_LINK;
+    var sqe = try loop.ring.setsockopt(2, listen_fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, yes);
     sqe.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_FIXED_FILE;
     sqe = try loop.ring.setsockopt(3, listen_fd, linux.SOL.SOCKET, linux.SO.REUSEPORT, yes);
     sqe.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_FIXED_FILE;
@@ -44,7 +49,7 @@ pub fn main() !void {
     //assert(loop.ring.sq_ready() == 6);
 
     _ = try loop.ring.submit();
-    var n = try loop.ring.copy_cqes(&cqes, 7);
+    n = try loop.ring.copy_cqes(&cqes, 4);
     log.debug("cqes: {}", .{n});
     for (cqes[0..n]) |cqe| {
         log.debug("{}", .{cqe});
