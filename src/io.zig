@@ -136,7 +136,112 @@ pub const Loop = struct {
         };
         return op;
     }
+
+    pub fn listen(
+        self: *Loop,
+        fd: linux.fd_t,
+        addr: std.net.Address,
+        opt: std.net.Address.ListenOptions,
+        context: anytype,
+        comptime onComplete: fn (@TypeOf(context), anyerror!void) anyerror!void,
+    ) !*Op {
+        try self.ensureUnusedSqes(if (opt.reuse_address) 4 else 2);
+        const op = try self.op_pool.create();
+        var sqe: *linux.io_uring_sqe = undefined;
+
+        if (opt.reuse_address) {
+            sqe = try self.ring.setsockopt(0, fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, yes_socket_option);
+            sqe.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_FIXED_FILE;
+            sqe = try self.ring.setsockopt(0, fd, linux.SOL.SOCKET, linux.SO.REUSEPORT, yes_socket_option);
+            sqe.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_FIXED_FILE;
+        }
+        sqe = try self.ring.bind(0, fd, &addr.any, addr.getOsSockLen(), 0);
+        sqe.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_FIXED_FILE;
+        sqe = try self.ring.listen(@intFromPtr(op), fd, opt.kernel_backlog, 0);
+        sqe.flags |= linux.IOSQE_FIXED_FILE;
+
+        op.* = .{
+            .context = context,
+            .onComplete = struct {
+                const Context = @TypeOf(context);
+                fn complete(op_: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
+                    const ctx: Context = @alignCast(@ptrCast(op_.context orelse return));
+                    switch (cqe.err()) {
+                        .SUCCESS => try onComplete(ctx, {}),
+                        else => |errno| try onComplete(ctx, errFromErrno(errno)),
+                    }
+                }
+            }.complete,
+        };
+        return op;
+    }
+
+    pub fn accept(
+        self: *Loop,
+        fd: linux.fd_t,
+        context: anytype,
+        comptime onComplete: fn (@TypeOf(context), anyerror!linux.fd_t) anyerror!void,
+    ) !*Op {
+        try self.ensureUnusedSqes(1);
+        const op = try self.op_pool.create();
+
+        var sqe = try self.ring.accept_direct(@intFromPtr(op), fd, null, null, 0);
+        sqe.flags |= linux.IOSQE_FIXED_FILE;
+
+        op.* = .{
+            .context = context,
+            .onComplete = struct {
+                const Context = @TypeOf(context);
+                fn complete(op_: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
+                    const ctx: Context = @alignCast(@ptrCast(op_.context orelse return));
+                    switch (cqe.err()) {
+                        .SUCCESS => try onComplete(ctx, @intCast(cqe.res)),
+                        else => |errno| try onComplete(ctx, errFromErrno(errno)),
+                    }
+                }
+            }.complete,
+        };
+        return op;
+    }
+
+    pub fn recv(
+        self: *Loop,
+        fd: linux.fd_t,
+        buffer: []u8,
+        context: anytype,
+        comptime onComplete: fn (@TypeOf(context), anyerror!u32) anyerror!void,
+    ) !*Op {
+        try self.ensureUnusedSqes(1);
+        const op = try self.op_pool.create();
+
+        var sqe = try self.ring.recv(@intFromPtr(op), fd, .{ .buffer = buffer }, 0);
+        sqe.flags |= linux.IOSQE_FIXED_FILE;
+
+        op.* = .{
+            .context = context,
+            .onComplete = struct {
+                const Context = @TypeOf(context);
+                fn complete(op_: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
+                    const ctx: Context = @alignCast(@ptrCast(op_.context orelse return));
+                    switch (cqe.err()) {
+                        .SUCCESS => try onComplete(ctx, @intCast(cqe.res)),
+                        else => |errno| try onComplete(ctx, errFromErrno(errno)),
+                    }
+                }
+            }.complete,
+        };
+        return op;
+    }
+
+    pub fn close(self: *Loop, fd: linux.fd_t) !void {
+        try self.ensureUnusedSqes(1);
+        var sqe = try self.ring.close_direct(0, @intCast(fd));
+        sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
+    }
 };
+
+const yes_value: u32 = 1;
+const yes_socket_option = std.mem.asBytes(&yes_value);
 
 pub const Op = struct {
     context: ?*anyopaque,
@@ -317,4 +422,82 @@ test "OutOfMemory on operation pool full" {
         };
     }
     unreachable;
+}
+test "tcp server" {
+    // echo -n one | nc -w0 localhost 9898 && echo -n two | nc -w0 localhost 9898 && echo -n three | nc -w0 localhost 9898 && echo -n four | nc -w0 localhost 9898
+
+    var loop = try Loop.init(.{
+        .entries = 16,
+        .fd_nr = 2,
+        .op_pool = OpPool.init(testing.allocator),
+    });
+    defer loop.deinit();
+
+    const Server = struct {
+        const Self = @This();
+        addr: std.net.Address,
+        loop: *Loop,
+        buffer: [128]u8 = undefined,
+        buffer_pos: usize = 0,
+        listen_fd: ?linux.fd_t = null,
+        conn_fd: ?linux.fd_t = null,
+        conn_count: usize = 0,
+        listen: bool = false,
+
+        fn start(self: *Self) !void {
+            _ = try self.loop.socket(self.addr.any.family, linux.SOCK.STREAM, self, onSocket);
+        }
+
+        fn onSocket(self: *Self, err_fd: anyerror!linux.fd_t) anyerror!void {
+            const fd = try err_fd;
+            self.listen_fd = fd;
+            _ = try self.loop.listen(fd, self.addr, .{ .reuse_address = true }, self, onListen);
+        }
+
+        fn onListen(self: *Self, maybe_err: anyerror!void) anyerror!void {
+            _ = try maybe_err;
+            self.listen = true;
+            _ = try self.loop.accept(self.listen_fd.?, self, onAccept);
+        }
+
+        fn onAccept(self: *Self, err_fd: anyerror!linux.fd_t) anyerror!void {
+            const fd = try err_fd;
+            self.conn_fd = fd;
+            _ = try self.loop.recv(fd, self.buffer[self.buffer_pos..], self, onRecv);
+        }
+
+        fn onRecv(self: *Self, err_n: anyerror!u32) anyerror!void {
+            const n = try err_n;
+            self.conn_count += 1;
+            self.buffer_pos += n;
+            try self.loop.close(self.conn_fd.?);
+            self.conn_fd = null;
+            _ = try self.loop.accept(self.listen_fd.?, self, onAccept);
+        }
+    };
+
+    const addr: std.net.Address = try std.net.Address.resolveIp("127.0.0.1", 9898);
+    var server: Server = .{
+        .loop = &loop,
+        .addr = addr,
+    };
+
+    try server.start();
+    while (!server.listen) try loop.run(1);
+
+    var thr = try std.Thread.spawn(.{}, testSend, .{addr});
+    while (server.conn_count < 4) {
+        try loop.run(1);
+    }
+    thr.join();
+
+    try testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 2, 3 }, server.buffer[0..server.buffer_pos]);
+}
+
+fn testSend(addr: std.net.Address) void {
+    for (0..4) |n| {
+        var stream = std.net.tcpConnectToAddress(addr) catch unreachable;
+        stream.writeAll(&[_]u8{@intCast(n)}) catch unreachable;
+        stream.close();
+    }
 }
