@@ -18,33 +18,31 @@ pub const Options = struct {
     op_pool: OpPool,
 };
 
-fn peek_cqes(ring: *linux.IoUring, cqes: []linux.io_uring_cqe, wait_nr: u32) !u32 {
-    const count = peek_cqes_ready(ring, cqes);
-    if (count > 0) return count;
+fn peek_cqes(ring: *linux.IoUring, wait_nr: u32) !PeekCqesResult {
+    const res = peek_cqes_ready(ring);
+    if (res.cqes.len > 0) return res;
     if (ring.cq_ring_needs_flush() or wait_nr > 0) {
         _ = try ring.enter(0, wait_nr, linux.IORING_ENTER_GETEVENTS);
-        return peek_cqes_ready(ring, cqes);
+        return peek_cqes_ready(ring);
     }
-    return 0;
+    return .{ .cqes = &.{}, .ready = 0 };
 }
 
-fn peek_cqes_ready(ring: *linux.IoUring, cqes: []linux.io_uring_cqe) u32 {
+const PeekCqesResult = struct {
+    cqes: []linux.io_uring_cqe,
+    ready: u32,
+
+    fn hasMore(self: @This()) bool {
+        return self.ready > self.cqes.len;
+    }
+};
+
+fn peek_cqes_ready(ring: *linux.IoUring) PeekCqesResult {
     const ready = ring.cq_ready();
-    const count = @min(cqes.len, ready);
     const head = ring.cq.head.* & ring.cq.mask;
 
-    // before wrapping
-    const n = @min(ring.cq.cqes.len - head, count);
-    @memcpy(cqes[0..n], ring.cq.cqes[head..][0..n]);
-
-    if (count > n) {
-        // wrap self.cq.cqes
-        const w = count - n;
-        @memcpy(cqes[n..][0..w], ring.cq.cqes[0..w]);
-    }
-
-    //ring.cq_advance(count);
-    return count;
+    const n = @min(ring.cq.cqes.len - head, ready);
+    return .{ .cqes = ring.cq.cqes[head..][0..n], .ready = ready };
 }
 
 pub const Loop = struct {
@@ -66,25 +64,37 @@ pub const Loop = struct {
     }
 
     pub fn run(self: *Self, wait_nr: u32) !void {
-        // TODO on callback error advance samo za one koji se obradio
-        var cqes: [4]linux.io_uring_cqe = undefined;
-
+        // Push sqe's to the kernel
         _ = try self.ring.submit();
-        const n = try peek_cqes(&self.ring, &cqes, wait_nr);
-        var advance_nr: u32 = 0;
-        defer self.ring.cq_advance(advance_nr);
 
-        //const n = try self.ring.copy_cqes(&cqes, wait_nr);
-        for (cqes[0..n]) |cqe| {
-            if (cqe.user_data == 0) {
-                advance_nr += 1;
-                continue;
+        var completed: u32 = 0; // number of completed cqe's in this run
+        defer self.ring.cq_advance(completed);
+
+        // Process all pending cqe's
+        while (true) {
+            const res = try peek_cqes(&self.ring, wait_nr);
+            for (res.cqes) |cqe| {
+                if (cqe.user_data == 0) {
+                    // cqe without Op in userdata
+                    completed += 1;
+                    continue;
+                }
+                const op: *Op = @ptrFromInt(cqe.user_data);
+                try op.onComplete(op, self, cqe);
+                // Only advance if not error, will try next time same cqe in the
+                // case of error.
+                completed += 1;
+                if (!flagMore(cqe)) {
+                    // Done with operation return it to the pool
+                    self.op_pool.destroy(op);
+                }
             }
-            const op: *Op = @ptrFromInt(cqe.user_data);
-            try op.callback(op, self, cqe);
-            // only advance if not error, will try next time same cqe
-            advance_nr += 1;
+            if (!res.hasMore()) break;
         }
+    }
+
+    fn flagMore(cqe: linux.io_uring_cqe) bool {
+        return cqe.flags & linux.IORING_CQE_F_MORE > 0;
     }
 
     pub fn socket(
@@ -100,7 +110,7 @@ pub const Loop = struct {
 
         op.* = .{
             .context = context,
-            .callback = struct {
+            .onComplete = struct {
                 const Context = @TypeOf(context);
                 fn complete(op_: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
                     if (op_.context) |ptr| {
@@ -119,7 +129,7 @@ pub const Loop = struct {
 
 pub const Op = struct {
     context: ?*anyopaque,
-    callback: *const fn (*Op, *Loop, linux.io_uring_cqe) anyerror!void,
+    onComplete: *const fn (*Op, *Loop, linux.io_uring_cqe) anyerror!void,
 };
 
 test "socket" {
@@ -203,13 +213,8 @@ test "error in callback, should not advance cq ring" {
         fn onSocket(self: *Self, err_fd: anyerror!linux.fd_t) anyerror!void {
             _ = try err_fd;
             self.call_count += 1;
-            return error.Dummy;
-
-            // self.err = null;
-            // self.fd = err_fd catch |err| brk: {
-            //     self.err = err;
-            //     break :brk null;
-            // };
+            if (self.call_count % 2 != 0)
+                return error.OnSocketTestError;
         }
     };
     var ctx: Ctx = .{};
@@ -217,12 +222,19 @@ test "error in callback, should not advance cq ring" {
     const domain = addr.any.family;
     const socket_type = linux.SOCK.STREAM;
 
-    { // success
+    { // error in callback handler, cqe will be retried
         _ = try loop.socket(domain, socket_type, &ctx, Ctx.onSocket);
-        try testing.expectError(error.Dummy, loop.run(1));
+        try testing.expectEqual(0, loop.ring.cq_ready());
+        try testing.expectError(error.OnSocketTestError, loop.run(1));
         try testing.expectEqual(1, loop.ring.cq_ready());
-        //try testing.expectEqual(1, ctx.call_count);
-        //try testing.expect(ctx.fd != null);
-        //try testing.expect(ctx.err == null);
+        try testing.expectEqual(1, ctx.call_count);
+    }
+    { // retrying cqe, now succeeds
+        try testing.expect(loop.op_pool.free_list == null);
+        try testing.expectEqual(1, loop.ring.cq_ready());
+        try loop.run(0);
+        try testing.expectEqual(0, loop.ring.cq_ready());
+        try testing.expectEqual(2, ctx.call_count);
+        try testing.expect(loop.op_pool.free_list != null);
     }
 }
