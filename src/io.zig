@@ -126,12 +126,10 @@ pub const Loop = struct {
             .onComplete = struct {
                 const Context = @TypeOf(context);
                 fn complete(op_: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
-                    if (op_.context) |ptr| {
-                        const ctx: Context = @alignCast(@ptrCast(ptr));
-                        switch (cqe.err()) {
-                            .SUCCESS => try onComplete(ctx, @intCast(cqe.res)),
-                            else => |errno| try onComplete(ctx, errFromErrno(errno)),
-                        }
+                    const ctx: Context = @alignCast(@ptrCast(op_.context orelse return));
+                    switch (cqe.err()) {
+                        .SUCCESS => try onComplete(ctx, @intCast(cqe.res)),
+                        else => |errno| try onComplete(ctx, errFromErrno(errno)),
                     }
                 }
             }.complete,
@@ -143,6 +141,11 @@ pub const Loop = struct {
 pub const Op = struct {
     context: ?*anyopaque,
     onComplete: *const fn (*Op, *Loop, linux.io_uring_cqe) anyerror!void,
+
+    pub fn detach(self: *Op, context: *anyopaque) void {
+        assert(self.context.? == context);
+        self.context = null;
+    }
 };
 
 test "socket" {
@@ -212,7 +215,7 @@ test "error in callback, should not advance cq ring" {
     var loop = try Loop.init(.{
         .entries = 1,
         .fd_nr = 2,
-        .op_pool = std.heap.MemoryPool(Op).init(testing.allocator),
+        .op_pool = OpPool.init(testing.allocator),
     });
     defer loop.deinit();
 
@@ -225,8 +228,7 @@ test "error in callback, should not advance cq ring" {
         fn onSocket(self: *Self, err_fd: anyerror!linux.fd_t) anyerror!void {
             _ = try err_fd;
             self.call_count += 1;
-            if (self.call_count % 2 != 0)
-                return error.OnSocketTestError;
+            return error.OnSocketTestError;
         }
     };
     var ctx: Ctx = .{};
@@ -234,19 +236,20 @@ test "error in callback, should not advance cq ring" {
     const socket_type = linux.SOCK.STREAM;
 
     { // error in callback handler, cqe will be retried
-        _ = try loop.socket(domain, socket_type, &ctx, Ctx.onSocket);
+        const op = try loop.socket(domain, socket_type, &ctx, Ctx.onSocket);
         try testing.expectEqual(0, loop.ring.cq_ready());
         try testing.expectError(error.OnSocketTestError, loop.run(1));
         try testing.expectEqual(1, loop.ring.cq_ready());
         try testing.expectEqual(1, ctx.call_count);
+        op.detach(&ctx);
     }
     { // retrying cqe, now succeeds
         try testing.expect(loop.op_pool.free_list == null);
         try testing.expectEqual(1, loop.ring.cq_ready());
         try loop.run(0);
         try testing.expectEqual(0, loop.ring.cq_ready());
-        try testing.expectEqual(2, ctx.call_count);
         try testing.expect(loop.op_pool.free_list != null);
+        try testing.expectEqual(1, ctx.call_count);
     }
 }
 
@@ -254,7 +257,7 @@ test "ensure unused sqes pushes sqes to the kernel" {
     var loop = try Loop.init(.{
         .entries = 2,
         .fd_nr = 2,
-        .op_pool = std.heap.MemoryPool(Op).init(testing.allocator),
+        .op_pool = OpPool.init(testing.allocator),
     });
     defer loop.deinit();
 
@@ -273,7 +276,45 @@ test "ensure unused sqes pushes sqes to the kernel" {
     const domain = linux.AF.INET;
     const socket_type = linux.SOCK.STREAM;
 
+    // 2 entries but 3 prepared sqe
+    // there was submit in ensureUnusedSqes
     _ = try loop.socket(domain, socket_type, &ctx, Ctx.onSocket);
     _ = try loop.socket(domain, socket_type, &ctx, Ctx.onSocket);
     _ = try loop.socket(domain, socket_type, &ctx, Ctx.onSocket);
+}
+
+test "OutOfMemory on operation pool full" {
+    var fba_buf: [@sizeOf(Op) * 10]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
+
+    var loop = try Loop.init(.{
+        .entries = 2,
+        .fd_nr = 2,
+        .op_pool = std.heap.MemoryPool(Op).init(fba.allocator()),
+    });
+    defer loop.deinit();
+
+    const Ctx = struct {
+        const Self = @This();
+        call_count: usize = 0,
+        err: ?anyerror = null,
+        fd: ?linux.fd_t = null,
+
+        fn onSocket(self: *Self, err_fd: anyerror!linux.fd_t) anyerror!void {
+            _ = self;
+            _ = try err_fd;
+        }
+    };
+
+    var ctx: Ctx = .{};
+    const domain = linux.AF.INET;
+    const socket_type = linux.SOCK.STREAM;
+
+    for (0..1024) |_| {
+        _ = loop.socket(domain, socket_type, &ctx, Ctx.onSocket) catch |err| switch (err) {
+            error.OutOfMemory => return,
+            else => unreachable,
+        };
+    }
+    unreachable;
 }
