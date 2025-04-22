@@ -10,7 +10,7 @@ pub const Options = struct {
     /// Number of submission queue entries
     entries: u16,
     /// io_uring init flags
-    flags: u32 = linux.IORING_SETUP_SQPOLL | linux.IORING_SETUP_SINGLE_ISSUER,
+    flags: u32 = linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_SQPOLL,
     /// Number of kernel registered file descriptors
     fd_nr: u16,
     /// Provided pool operations pool.
@@ -97,6 +97,19 @@ pub const Loop = struct {
         return cqe.flags & linux.IORING_CQE_F_MORE > 0;
     }
 
+    /// Number of unused free submission queue entries
+    pub fn unusedSqes(self: *Self) u32 {
+        return @as(u32, @intCast(self.ring.sq.sqes.len)) - self.ring.sq_ready();
+    }
+
+    fn ensureUnusedSqes(self: *Self, count: u32) !void {
+        assert(count <= self.ring.sq.sqes.len);
+        while (self.unusedSqes() < count) {
+            // TODO: is it safe to loop here
+            _ = try self.ring.submit();
+        }
+    }
+
     pub fn socket(
         self: *Loop,
         domain: u32,
@@ -104,7 +117,7 @@ pub const Loop = struct {
         context: anytype,
         comptime onComplete: fn (@TypeOf(context), anyerror!linux.fd_t) anyerror!void,
     ) !*Op {
-        // TODO ensure usused sqe capacity 1
+        try self.ensureUnusedSqes(1);
         const op = try self.op_pool.create();
         _ = try self.ring.socket_direct_alloc(@intFromPtr(op), domain, socket_type, 0, 0);
 
@@ -134,7 +147,7 @@ pub const Op = struct {
 
 test "socket" {
     var loop = try Loop.init(.{
-        .entries = 16,
+        .entries = 1,
         .fd_nr = 2,
         .op_pool = std.heap.MemoryPool(Op).init(testing.allocator),
     });
@@ -156,8 +169,7 @@ test "socket" {
         }
     };
     var ctx: Ctx = .{};
-    const addr: std.net.Address = try .resolveIp("127.0.0.1", 0);
-    const domain = addr.any.family;
+    const domain = linux.AF.INET;
     const socket_type = linux.SOCK.STREAM;
 
     { // success
@@ -198,7 +210,7 @@ test "socket" {
 
 test "error in callback, should not advance cq ring" {
     var loop = try Loop.init(.{
-        .entries = 16,
+        .entries = 1,
         .fd_nr = 2,
         .op_pool = std.heap.MemoryPool(Op).init(testing.allocator),
     });
@@ -218,8 +230,7 @@ test "error in callback, should not advance cq ring" {
         }
     };
     var ctx: Ctx = .{};
-    const addr: std.net.Address = try .resolveIp("127.0.0.1", 0);
-    const domain = addr.any.family;
+    const domain = linux.AF.INET;
     const socket_type = linux.SOCK.STREAM;
 
     { // error in callback handler, cqe will be retried
@@ -237,4 +248,32 @@ test "error in callback, should not advance cq ring" {
         try testing.expectEqual(2, ctx.call_count);
         try testing.expect(loop.op_pool.free_list != null);
     }
+}
+
+test "ensure unused sqes pushes sqes to the kernel" {
+    var loop = try Loop.init(.{
+        .entries = 2,
+        .fd_nr = 2,
+        .op_pool = std.heap.MemoryPool(Op).init(testing.allocator),
+    });
+    defer loop.deinit();
+
+    const Ctx = struct {
+        const Self = @This();
+        call_count: usize = 0,
+        err: ?anyerror = null,
+        fd: ?linux.fd_t = null,
+
+        fn onSocket(self: *Self, err_fd: anyerror!linux.fd_t) anyerror!void {
+            _ = self;
+            _ = try err_fd;
+        }
+    };
+    var ctx: Ctx = .{};
+    const domain = linux.AF.INET;
+    const socket_type = linux.SOCK.STREAM;
+
+    _ = try loop.socket(domain, socket_type, &ctx, Ctx.onSocket);
+    _ = try loop.socket(domain, socket_type, &ctx, Ctx.onSocket);
+    _ = try loop.socket(domain, socket_type, &ctx, Ctx.onSocket);
 }
