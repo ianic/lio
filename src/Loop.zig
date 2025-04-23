@@ -4,7 +4,7 @@ const linux = std.os.linux;
 const testing = std.testing;
 
 const errFromErrno = @import("errno.zig").toError;
-const OpPool = std.heap.MemoryPool(Op);
+pub const OpPool = std.heap.MemoryPool(Op);
 
 pub const Options = struct {
     /// Number of submission queue entries
@@ -35,6 +35,9 @@ const yes_socket_option = std.mem.asBytes(&yes_value);
 
 ring: linux.IoUring,
 op_pool: OpPool = undefined,
+metric: struct {
+    active_op: usize = 0,
+} = .{},
 
 pub fn init(opt: Options) !Loop {
     var ring = try linux.IoUring.init(opt.entries, opt.flags);
@@ -52,6 +55,16 @@ pub fn run(self: *Loop, wait_nr: u32) !void {
     // Push sqe's to the kernel
     _ = try self.ring.submit();
     try self.drainCqes(wait_nr);
+}
+
+pub fn tick(self: *Loop) !void {
+    try self.run(1);
+}
+
+/// Tick loop while there is active operations
+pub fn drain(self: *Loop) !void {
+    while (self.metric.active_op > 0)
+        try self.tick();
 }
 
 /// Process all pending completion queue entries. If there are no pending
@@ -77,6 +90,7 @@ fn drainCqes(self: *Loop, wait_nr: u32) !void {
             if (!flagMore(cqe)) {
                 // Done with operation return it to the pool
                 self.op_pool.destroy(op);
+                self.metric.active_op -= 1;
             }
         }
         if (!res.hasMore()) break;
@@ -131,6 +145,12 @@ fn ensureUnusedSqes(self: *Loop, count: u32) !void {
     }
 }
 
+fn createOp(self: *Loop) !*Op {
+    const op = try self.op_pool.create();
+    self.metric.active_op += 1;
+    return op;
+}
+
 pub fn socket(
     self: *Loop,
     domain: u32,
@@ -139,7 +159,7 @@ pub fn socket(
     comptime onComplete: fn (@TypeOf(context), anyerror!linux.fd_t) anyerror!void,
 ) !*Op {
     try self.ensureUnusedSqes(1);
-    const op = try self.op_pool.create();
+    const op = try self.createOp();
     _ = try self.ring.socket_direct_alloc(@intFromPtr(op), domain, socket_type, 0, 0);
 
     op.* = .{
@@ -167,7 +187,7 @@ pub fn listen(
     comptime onComplete: fn (@TypeOf(context), anyerror!void) anyerror!void,
 ) !*Op {
     try self.ensureUnusedSqes(if (opt.reuse_address) 4 else 2);
-    const op = try self.op_pool.create();
+    const op = try self.createOp();
     var sqe: *linux.io_uring_sqe = undefined;
 
     if (opt.reuse_address) {
@@ -204,7 +224,7 @@ pub fn accept(
     comptime onComplete: fn (@TypeOf(context), anyerror!linux.fd_t) anyerror!void,
 ) !*Op {
     try self.ensureUnusedSqes(1);
-    const op = try self.op_pool.create();
+    const op = try self.createOp();
 
     var sqe = try self.ring.accept_direct(@intFromPtr(op), fd, null, null, 0);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
@@ -233,7 +253,7 @@ pub fn recv(
     comptime onComplete: fn (@TypeOf(context), anyerror!u32) anyerror!void,
 ) !*Op {
     try self.ensureUnusedSqes(1);
-    const op = try self.op_pool.create();
+    const op = try self.createOp();
 
     var sqe = try self.ring.recv(@intFromPtr(op), fd, .{ .buffer = buffer }, 0);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
@@ -257,6 +277,12 @@ pub fn recv(
 pub fn close(self: *Loop, fd: linux.fd_t) !void {
     try self.ensureUnusedSqes(1);
     var sqe = try self.ring.close_direct(0, @intCast(fd));
+    sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
+}
+
+pub fn cancel(self: *Loop, op_to_cancel: *Op) !void {
+    try self.ensureUnusedSqes(1);
+    var sqe = try self.ring.cancel(0, @intFromPtr(op_to_cancel), 0);
     sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
 }
 
