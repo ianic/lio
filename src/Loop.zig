@@ -18,235 +18,6 @@ pub const Options = struct {
     op_pool: OpPool,
 };
 
-pub const Loop = struct {
-    const Self = @This();
-
-    ring: linux.IoUring,
-    op_pool: OpPool = undefined,
-
-    pub fn init(opt: Options) !Self {
-        var ring = try linux.IoUring.init(opt.entries, opt.flags);
-        errdefer ring.deinit();
-        try ring.register_files_sparse(opt.fd_nr);
-        return .{ .ring = ring, .op_pool = opt.op_pool };
-    }
-
-    pub fn deinit(self: *Self) void {
-        self.op_pool.deinit();
-        self.ring.deinit();
-    }
-
-    pub fn run(self: *Self, wait_nr: u32) !void {
-        // Push sqe's to the kernel
-        _ = try self.ring.submit();
-
-        var completed: u32 = 0; // number of completed cqe's in this run
-        defer self.ring.cq_advance(completed);
-
-        // Process all pending cqe's
-        var res = try self.peekCqes(wait_nr);
-        while (true) {
-            for (res.cqes) |cqe| {
-                if (cqe.user_data == 0) {
-                    // cqe without Op in userdata
-                    completed += 1;
-                    continue;
-                }
-                const op: *Op = @ptrFromInt(cqe.user_data);
-                try op.onComplete(op, self, cqe);
-                // Only advance if not error, will try next time same cqe in the
-                // case of error.
-                completed += 1;
-                if (!flagMore(cqe)) {
-                    // Done with operation return it to the pool
-                    self.op_pool.destroy(op);
-                }
-            }
-            if (!res.hasMore()) break;
-            res = try self.peekCqes(0);
-        }
-    }
-
-    const PeekCqesResult = struct {
-        cqes: []linux.io_uring_cqe,
-        ready: u32,
-
-        fn hasMore(self: @This()) bool {
-            return self.ready > self.cqes.len;
-        }
-    };
-
-    fn peekCqes(self: *Self, wait_nr: u32) !PeekCqesResult {
-        const res = self.peekCqesReady();
-        if (res.cqes.len > 0) return res;
-
-        var ring = &self.ring;
-        if (ring.cq_ring_needs_flush() or wait_nr > 0) {
-            _ = try ring.enter(0, wait_nr, linux.IORING_ENTER_GETEVENTS);
-            return self.peekCqesReady();
-        }
-        return .{ .cqes = &.{}, .ready = 0 };
-    }
-
-    fn peekCqesReady(self: *Self) PeekCqesResult {
-        var ring = &self.ring;
-        const ready = ring.cq_ready();
-        const head = ring.cq.head.* & ring.cq.mask;
-
-        const n = @min(ring.cq.cqes.len - head, ready);
-        return .{ .cqes = ring.cq.cqes[head..][0..n], .ready = ready };
-    }
-
-    fn flagMore(cqe: linux.io_uring_cqe) bool {
-        return cqe.flags & linux.IORING_CQE_F_MORE > 0;
-    }
-
-    /// Number of unused free submission queue entries
-    pub fn unusedSqes(self: *Self) u32 {
-        return @as(u32, @intCast(self.ring.sq.sqes.len)) - self.ring.sq_ready();
-    }
-
-    fn ensureUnusedSqes(self: *Self, count: u32) !void {
-        assert(count <= self.ring.sq.sqes.len);
-        while (self.unusedSqes() < count) {
-            // TODO: is it safe to loop here
-            _ = try self.ring.submit();
-        }
-    }
-
-    pub fn socket(
-        self: *Loop,
-        domain: u32,
-        socket_type: u32,
-        context: anytype,
-        comptime onComplete: fn (@TypeOf(context), anyerror!linux.fd_t) anyerror!void,
-    ) !*Op {
-        try self.ensureUnusedSqes(1);
-        const op = try self.op_pool.create();
-        _ = try self.ring.socket_direct_alloc(@intFromPtr(op), domain, socket_type, 0, 0);
-
-        op.* = .{
-            .context = context,
-            .onComplete = struct {
-                const Context = @TypeOf(context);
-                fn complete(op_: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
-                    const ctx: Context = @alignCast(@ptrCast(op_.context orelse return));
-                    switch (cqe.err()) {
-                        .SUCCESS => try onComplete(ctx, @intCast(cqe.res)),
-                        else => |errno| try onComplete(ctx, errFromErrno(errno)),
-                    }
-                }
-            }.complete,
-        };
-        return op;
-    }
-
-    pub fn listen(
-        self: *Loop,
-        fd: linux.fd_t,
-        addr: std.net.Address,
-        opt: std.net.Address.ListenOptions,
-        context: anytype,
-        comptime onComplete: fn (@TypeOf(context), anyerror!void) anyerror!void,
-    ) !*Op {
-        try self.ensureUnusedSqes(if (opt.reuse_address) 4 else 2);
-        const op = try self.op_pool.create();
-        var sqe: *linux.io_uring_sqe = undefined;
-
-        if (opt.reuse_address) {
-            sqe = try self.ring.setsockopt(0, fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, yes_socket_option);
-            sqe.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_FIXED_FILE;
-            sqe = try self.ring.setsockopt(0, fd, linux.SOL.SOCKET, linux.SO.REUSEPORT, yes_socket_option);
-            sqe.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_FIXED_FILE;
-        }
-        sqe = try self.ring.bind(0, fd, &addr.any, addr.getOsSockLen(), 0);
-        sqe.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_FIXED_FILE;
-        sqe = try self.ring.listen(@intFromPtr(op), fd, opt.kernel_backlog, 0);
-        sqe.flags |= linux.IOSQE_FIXED_FILE;
-
-        op.* = .{
-            .context = context,
-            .onComplete = struct {
-                const Context = @TypeOf(context);
-                fn complete(op_: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
-                    const ctx: Context = @alignCast(@ptrCast(op_.context orelse return));
-                    switch (cqe.err()) {
-                        .SUCCESS => try onComplete(ctx, {}),
-                        else => |errno| try onComplete(ctx, errFromErrno(errno)),
-                    }
-                }
-            }.complete,
-        };
-        return op;
-    }
-
-    pub fn accept(
-        self: *Loop,
-        fd: linux.fd_t,
-        context: anytype,
-        comptime onComplete: fn (@TypeOf(context), anyerror!linux.fd_t) anyerror!void,
-    ) !*Op {
-        try self.ensureUnusedSqes(1);
-        const op = try self.op_pool.create();
-
-        var sqe = try self.ring.accept_direct(@intFromPtr(op), fd, null, null, 0);
-        sqe.flags |= linux.IOSQE_FIXED_FILE;
-
-        op.* = .{
-            .context = context,
-            .onComplete = struct {
-                const Context = @TypeOf(context);
-                fn complete(op_: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
-                    const ctx: Context = @alignCast(@ptrCast(op_.context orelse return));
-                    switch (cqe.err()) {
-                        .SUCCESS => try onComplete(ctx, @intCast(cqe.res)),
-                        else => |errno| try onComplete(ctx, errFromErrno(errno)),
-                    }
-                }
-            }.complete,
-        };
-        return op;
-    }
-
-    pub fn recv(
-        self: *Loop,
-        fd: linux.fd_t,
-        buffer: []u8,
-        context: anytype,
-        comptime onComplete: fn (@TypeOf(context), anyerror!u32) anyerror!void,
-    ) !*Op {
-        try self.ensureUnusedSqes(1);
-        const op = try self.op_pool.create();
-
-        var sqe = try self.ring.recv(@intFromPtr(op), fd, .{ .buffer = buffer }, 0);
-        sqe.flags |= linux.IOSQE_FIXED_FILE;
-
-        op.* = .{
-            .context = context,
-            .onComplete = struct {
-                const Context = @TypeOf(context);
-                fn complete(op_: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
-                    const ctx: Context = @alignCast(@ptrCast(op_.context orelse return));
-                    switch (cqe.err()) {
-                        .SUCCESS => try onComplete(ctx, @intCast(cqe.res)),
-                        else => |errno| try onComplete(ctx, errFromErrno(errno)),
-                    }
-                }
-            }.complete,
-        };
-        return op;
-    }
-
-    pub fn close(self: *Loop, fd: linux.fd_t) !void {
-        try self.ensureUnusedSqes(1);
-        var sqe = try self.ring.close_direct(0, @intCast(fd));
-        sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
-    }
-};
-
-const yes_value: u32 = 1;
-const yes_socket_option = std.mem.asBytes(&yes_value);
-
 pub const Op = struct {
     context: ?*anyopaque,
     onComplete: *const fn (*Op, *Loop, linux.io_uring_cqe) anyerror!void,
@@ -256,6 +27,238 @@ pub const Op = struct {
         self.context = null;
     }
 };
+
+const Loop = @This();
+
+const yes_value: u32 = 1;
+const yes_socket_option = std.mem.asBytes(&yes_value);
+
+ring: linux.IoUring,
+op_pool: OpPool = undefined,
+
+pub fn init(opt: Options) !Loop {
+    var ring = try linux.IoUring.init(opt.entries, opt.flags);
+    errdefer ring.deinit();
+    try ring.register_files_sparse(opt.fd_nr);
+    return .{ .ring = ring, .op_pool = opt.op_pool };
+}
+
+pub fn deinit(self: *Loop) void {
+    self.op_pool.deinit();
+    self.ring.deinit();
+}
+
+pub fn run(self: *Loop, wait_nr: u32) !void {
+    // Push sqe's to the kernel
+    _ = try self.ring.submit();
+    try self.drainCqes(wait_nr);
+}
+
+/// Process all pending completion queue entries. If there are no pending
+/// cqe's wait for at least wait_nr to be completed.
+fn drainCqes(self: *Loop, wait_nr: u32) !void {
+    var completed: u32 = 0; // number of completed cqe's in this run
+    defer self.ring.cq_advance(completed);
+
+    // Process all pending cqe's
+    var res = try self.peekCqes(wait_nr);
+    while (true) {
+        for (res.cqes) |cqe| {
+            if (cqe.user_data == 0) {
+                // cqe without Op in userdata
+                completed += 1;
+                continue;
+            }
+            const op: *Op = @ptrFromInt(cqe.user_data);
+            try op.onComplete(op, self, cqe);
+            // Only advance if not error, will try next time same cqe in the
+            // case of error.
+            completed += 1;
+            if (!flagMore(cqe)) {
+                // Done with operation return it to the pool
+                self.op_pool.destroy(op);
+            }
+        }
+        if (!res.hasMore()) break;
+        res = try self.peekCqes(0);
+    }
+}
+
+const PeekCqesResult = struct {
+    cqes: []linux.io_uring_cqe,
+    ready: u32,
+
+    fn hasMore(self: @This()) bool {
+        return self.ready > self.cqes.len;
+    }
+};
+
+fn peekCqes(self: *Loop, wait_nr: u32) !PeekCqesResult {
+    const res = self.peekCqesReady();
+    if (res.cqes.len > 0) return res;
+
+    var ring = &self.ring;
+    if (ring.cq_ring_needs_flush() or wait_nr > 0) {
+        _ = try ring.enter(0, wait_nr, linux.IORING_ENTER_GETEVENTS);
+        return self.peekCqesReady();
+    }
+    return .{ .cqes = &.{}, .ready = 0 };
+}
+
+fn peekCqesReady(self: *Loop) PeekCqesResult {
+    var ring = &self.ring;
+    const ready = ring.cq_ready();
+    const head = ring.cq.head.* & ring.cq.mask;
+
+    const n = @min(ring.cq.cqes.len - head, ready);
+    return .{ .cqes = ring.cq.cqes[head..][0..n], .ready = ready };
+}
+
+fn flagMore(cqe: linux.io_uring_cqe) bool {
+    return cqe.flags & linux.IORING_CQE_F_MORE > 0;
+}
+
+/// Number of unused free submission queue entries
+pub fn unusedSqes(self: *Loop) u32 {
+    return @as(u32, @intCast(self.ring.sq.sqes.len)) - self.ring.sq_ready();
+}
+
+fn ensureUnusedSqes(self: *Loop, count: u32) !void {
+    assert(count <= self.ring.sq.sqes.len);
+    while (self.unusedSqes() < count) {
+        // TODO: is it safe to loop here
+        _ = try self.ring.submit();
+    }
+}
+
+pub fn socket(
+    self: *Loop,
+    domain: u32,
+    socket_type: u32,
+    context: anytype,
+    comptime onComplete: fn (@TypeOf(context), anyerror!linux.fd_t) anyerror!void,
+) !*Op {
+    try self.ensureUnusedSqes(1);
+    const op = try self.op_pool.create();
+    _ = try self.ring.socket_direct_alloc(@intFromPtr(op), domain, socket_type, 0, 0);
+
+    op.* = .{
+        .context = context,
+        .onComplete = struct {
+            const Context = @TypeOf(context);
+            fn complete(op_: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
+                const ctx: Context = @alignCast(@ptrCast(op_.context orelse return));
+                switch (cqe.err()) {
+                    .SUCCESS => try onComplete(ctx, @intCast(cqe.res)),
+                    else => |errno| try onComplete(ctx, errFromErrno(errno)),
+                }
+            }
+        }.complete,
+    };
+    return op;
+}
+
+pub fn listen(
+    self: *Loop,
+    fd: linux.fd_t,
+    addr: std.net.Address,
+    opt: std.net.Address.ListenOptions,
+    context: anytype,
+    comptime onComplete: fn (@TypeOf(context), anyerror!void) anyerror!void,
+) !*Op {
+    try self.ensureUnusedSqes(if (opt.reuse_address) 4 else 2);
+    const op = try self.op_pool.create();
+    var sqe: *linux.io_uring_sqe = undefined;
+
+    if (opt.reuse_address) {
+        sqe = try self.ring.setsockopt(0, fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, yes_socket_option);
+        sqe.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_FIXED_FILE;
+        sqe = try self.ring.setsockopt(0, fd, linux.SOL.SOCKET, linux.SO.REUSEPORT, yes_socket_option);
+        sqe.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_FIXED_FILE;
+    }
+    sqe = try self.ring.bind(0, fd, &addr.any, addr.getOsSockLen(), 0);
+    sqe.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_FIXED_FILE;
+    sqe = try self.ring.listen(@intFromPtr(op), fd, opt.kernel_backlog, 0);
+    sqe.flags |= linux.IOSQE_FIXED_FILE;
+
+    op.* = .{
+        .context = context,
+        .onComplete = struct {
+            const Context = @TypeOf(context);
+            fn complete(op_: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
+                const ctx: Context = @alignCast(@ptrCast(op_.context orelse return));
+                switch (cqe.err()) {
+                    .SUCCESS => try onComplete(ctx, {}),
+                    else => |errno| try onComplete(ctx, errFromErrno(errno)),
+                }
+            }
+        }.complete,
+    };
+    return op;
+}
+
+pub fn accept(
+    self: *Loop,
+    fd: linux.fd_t,
+    context: anytype,
+    comptime onComplete: fn (@TypeOf(context), anyerror!linux.fd_t) anyerror!void,
+) !*Op {
+    try self.ensureUnusedSqes(1);
+    const op = try self.op_pool.create();
+
+    var sqe = try self.ring.accept_direct(@intFromPtr(op), fd, null, null, 0);
+    sqe.flags |= linux.IOSQE_FIXED_FILE;
+
+    op.* = .{
+        .context = context,
+        .onComplete = struct {
+            const Context = @TypeOf(context);
+            fn complete(op_: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
+                const ctx: Context = @alignCast(@ptrCast(op_.context orelse return));
+                switch (cqe.err()) {
+                    .SUCCESS => try onComplete(ctx, @intCast(cqe.res)),
+                    else => |errno| try onComplete(ctx, errFromErrno(errno)),
+                }
+            }
+        }.complete,
+    };
+    return op;
+}
+
+pub fn recv(
+    self: *Loop,
+    fd: linux.fd_t,
+    buffer: []u8,
+    context: anytype,
+    comptime onComplete: fn (@TypeOf(context), anyerror!u32) anyerror!void,
+) !*Op {
+    try self.ensureUnusedSqes(1);
+    const op = try self.op_pool.create();
+
+    var sqe = try self.ring.recv(@intFromPtr(op), fd, .{ .buffer = buffer }, 0);
+    sqe.flags |= linux.IOSQE_FIXED_FILE;
+
+    op.* = .{
+        .context = context,
+        .onComplete = struct {
+            const Context = @TypeOf(context);
+            fn complete(op_: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
+                const ctx: Context = @alignCast(@ptrCast(op_.context orelse return));
+                switch (cqe.err()) {
+                    .SUCCESS => try onComplete(ctx, @intCast(cqe.res)),
+                    else => |errno| try onComplete(ctx, errFromErrno(errno)),
+                }
+            }
+        }.complete,
+    };
+    return op;
+}
+
+pub fn close(self: *Loop, fd: linux.fd_t) !void {
+    try self.ensureUnusedSqes(1);
+    var sqe = try self.ring.close_direct(0, @intCast(fd));
+    sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
+}
 
 test "socket" {
     var loop = try Loop.init(.{
