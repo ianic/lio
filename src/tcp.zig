@@ -2,17 +2,15 @@ const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 const testing = std.testing;
-
 const Loop = @import("Loop.zig");
 
 pub const Listener = struct {
     const Self = @This();
-    const Callback = *const fn (*anyopaque, anyerror!linux.fd_t) anyerror!void;
 
     loop: *Loop,
     addr: std.net.Address,
-    ptr: ?*anyopaque = null,
-    callback: Callback = undefined,
+    context: ?*anyopaque = null,
+    onConnect: *const fn (*Self, anyerror!linux.fd_t) anyerror!void = undefined,
     fd: ?linux.fd_t = null, // listening socket
     op: ?*Loop.Op = null, // accept operation
 
@@ -20,9 +18,19 @@ pub const Listener = struct {
         return .{ .loop = loop, .addr = addr };
     }
 
-    pub fn listen(self: *Self, ptr: *anyopaque, callback: Callback) !void {
-        self.ptr = ptr;
-        self.callback = callback;
+    pub fn listen(
+        self: *Self,
+        context: anytype,
+        comptime onConnect: *const fn (@TypeOf(context), anyerror!linux.fd_t) anyerror!void,
+    ) !void {
+        self.context = context;
+        self.onConnect = struct {
+            const Context = @TypeOf(context);
+            fn wrap(slf: *Self, fd_err: anyerror!linux.fd_t) anyerror!void {
+                const ctx: Context = @alignCast(@ptrCast(slf.context orelse return));
+                try onConnect(ctx, fd_err);
+            }
+        }.wrap;
         _ = try self.loop.socket(self.addr.any.family, linux.SOCK.STREAM, self, onSocket);
     }
 
@@ -30,10 +38,10 @@ pub const Listener = struct {
         if (fd_err) |fd| {
             self.fd = fd;
             _ = self.loop.listen(fd, self.addr, .{ .reuse_address = true }, self, onListen) catch |err| {
-                return try self.callback(self.ptr.?, err);
+                return try self.onConnect(self, err);
             };
         } else |err| {
-            try self.callback(self.ptr.?, err);
+            try self.onConnect(self, err);
         }
     }
 
@@ -41,23 +49,23 @@ pub const Listener = struct {
         if (_err) |_| {
             try self.accept();
         } else |err| {
-            try self.callback(self.ptr.?, err);
+            try self.onConnect(self, err);
         }
     }
 
     fn onAccept(self: *Self, fd_err: anyerror!linux.fd_t) anyerror!void {
         self.op = null;
-        try self.callback(self.ptr.?, fd_err);
+        try self.onConnect(self, fd_err);
         try self.accept();
     }
 
     fn accept(self: *Self) !void {
         self.op = self.loop.accept(self.fd.?, self, onAccept) catch |err| {
-            return try self.callback(self.ptr.?, err);
+            return try self.onConnect(self, err);
         };
     }
 
-    pub fn deinit(self: *Self) !void {
+    pub fn close(self: *Self) !void {
         if (self.fd) |fd| {
             _ = try self.loop.close(fd);
             self.fd = null;
@@ -67,6 +75,7 @@ pub const Listener = struct {
             op.detach(self);
             self.op = null;
         }
+        self.context = null;
     }
 };
 
@@ -78,32 +87,29 @@ test "connect to listener" {
     });
     defer loop.deinit();
 
-    const Ctx = struct {
+    const Server = struct {
         const Self = @This();
         conn_count: usize = 0,
         loop: *Loop,
 
-        fn onAccept(ptr: *anyopaque, fd_err: anyerror!linux.fd_t) anyerror!void {
-            const self: *Self = @ptrCast(@alignCast(ptr));
+        fn onConnect(self: *Self, fd_err: anyerror!linux.fd_t) anyerror!void {
             self.conn_count += 1;
-            if (fd_err) |fd| {
-                // std.debug.print("onAccept {} {}\n", .{ fd, self.conn_count });
-                try self.loop.close(fd);
-            } else |err| return err;
+            const conn_fd = try fd_err;
+            try self.loop.close(conn_fd);
         }
     };
-    var ctx: Ctx = .{ .loop = &loop };
+    var server: Server = .{ .loop = &loop };
 
     const addr: std.net.Address = try std.net.Address.resolveIp("127.0.0.1", 9899);
-    var server = Listener.init(&loop, addr);
-    try server.listen(&ctx, Ctx.onAccept);
+    var listener = Listener.init(&loop, addr);
+    try listener.listen(&server, Server.onConnect);
 
     var thr = try std.Thread.spawn(.{}, testConnect, .{addr});
-    while (ctx.conn_count < 1024)
+    while (server.conn_count < 1024)
         try loop.tick();
     thr.join();
 
-    try server.deinit();
+    try listener.close();
     try loop.drain();
 }
 
