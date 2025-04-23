@@ -18,33 +18,6 @@ pub const Options = struct {
     op_pool: OpPool,
 };
 
-fn peek_cqes(ring: *linux.IoUring, wait_nr: u32) !PeekCqesResult {
-    const res = peek_cqes_ready(ring);
-    if (res.cqes.len > 0) return res;
-    if (ring.cq_ring_needs_flush() or wait_nr > 0) {
-        _ = try ring.enter(0, wait_nr, linux.IORING_ENTER_GETEVENTS);
-        return peek_cqes_ready(ring);
-    }
-    return .{ .cqes = &.{}, .ready = 0 };
-}
-
-const PeekCqesResult = struct {
-    cqes: []linux.io_uring_cqe,
-    ready: u32,
-
-    fn hasMore(self: @This()) bool {
-        return self.ready > self.cqes.len;
-    }
-};
-
-fn peek_cqes_ready(ring: *linux.IoUring) PeekCqesResult {
-    const ready = ring.cq_ready();
-    const head = ring.cq.head.* & ring.cq.mask;
-
-    const n = @min(ring.cq.cqes.len - head, ready);
-    return .{ .cqes = ring.cq.cqes[head..][0..n], .ready = ready };
-}
-
 pub const Loop = struct {
     const Self = @This();
 
@@ -71,8 +44,8 @@ pub const Loop = struct {
         defer self.ring.cq_advance(completed);
 
         // Process all pending cqe's
+        var res = try self.peekCqes(wait_nr);
         while (true) {
-            const res = try peek_cqes(&self.ring, wait_nr);
             for (res.cqes) |cqe| {
                 if (cqe.user_data == 0) {
                     // cqe without Op in userdata
@@ -90,7 +63,38 @@ pub const Loop = struct {
                 }
             }
             if (!res.hasMore()) break;
+            res = try self.peekCqes(0);
         }
+    }
+
+    const PeekCqesResult = struct {
+        cqes: []linux.io_uring_cqe,
+        ready: u32,
+
+        fn hasMore(self: @This()) bool {
+            return self.ready > self.cqes.len;
+        }
+    };
+
+    fn peekCqes(self: *Self, wait_nr: u32) !PeekCqesResult {
+        const res = self.peekCqesReady();
+        if (res.cqes.len > 0) return res;
+
+        var ring = &self.ring;
+        if (ring.cq_ring_needs_flush() or wait_nr > 0) {
+            _ = try ring.enter(0, wait_nr, linux.IORING_ENTER_GETEVENTS);
+            return self.peekCqesReady();
+        }
+        return .{ .cqes = &.{}, .ready = 0 };
+    }
+
+    fn peekCqesReady(self: *Self) PeekCqesResult {
+        var ring = &self.ring;
+        const ready = ring.cq_ready();
+        const head = ring.cq.head.* & ring.cq.mask;
+
+        const n = @min(ring.cq.cqes.len - head, ready);
+        return .{ .cqes = ring.cq.cqes[head..][0..n], .ready = ready };
     }
 
     fn flagMore(cqe: linux.io_uring_cqe) bool {
