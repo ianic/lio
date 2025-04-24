@@ -2,42 +2,44 @@ const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 const testing = std.testing;
-const Loop = @import("Loop.zig");
+const io = @import("root.zig");
 
 pub const Listener = struct {
     const Self = @This();
 
-    loop: *Loop,
+    loop: *io.Loop,
     addr: std.net.Address,
-    context: ?*anyopaque = null,
-    onConnect: *const fn (*Self, anyerror!linux.fd_t) anyerror!void = undefined,
+    context: *anyopaque,
+    onConnect: *const fn (*Self, anyerror!linux.fd_t) anyerror!void,
     fd: ?linux.fd_t = null, // listening socket
-    op: ?*Loop.Op = null, // accept operation
+    op: ?*io.Loop.Op = null, // accept operation
 
-    pub fn init(loop: *Loop, addr: std.net.Address) Self {
-        return .{ .loop = loop, .addr = addr };
-    }
-
-    pub fn listen(
+    pub fn init(
         self: *Self,
+        loop: *io.Loop,
+        addr: std.net.Address,
         context: anytype,
         comptime onConnect: *const fn (@TypeOf(context), anyerror!linux.fd_t) anyerror!void,
     ) !void {
-        self.context = context;
-        self.onConnect = struct {
-            const Context = @TypeOf(context);
-            fn wrap(slf: *Self, fd_err: anyerror!linux.fd_t) anyerror!void {
-                const ctx: Context = @alignCast(@ptrCast(slf.context orelse return));
-                try onConnect(ctx, fd_err);
-            }
-        }.wrap;
+        self.* = .{
+            .loop = loop,
+            .addr = addr,
+            .context = context,
+            .onConnect = struct {
+                const Context = @TypeOf(context);
+                fn wrap(slf: *Self, fd_err: anyerror!linux.fd_t) anyerror!void {
+                    const ctx: Context = @alignCast(@ptrCast(slf.context));
+                    try onConnect(ctx, fd_err);
+                }
+            }.wrap,
+        };
         _ = try self.loop.socket(self.addr.any.family, linux.SOCK.STREAM, self, onSocket);
     }
 
     fn onSocket(self: *Self, fd_err: anyerror!linux.fd_t) anyerror!void {
         if (fd_err) |fd| {
             self.fd = fd;
-            _ = self.loop.listen(fd, self.addr, .{ .reuse_address = true }, self, onListen) catch |err| {
+            _ = self.loop.listen(fd, &self.addr, .{ .reuse_address = true }, self, onListen) catch |err| {
                 return try self.onConnect(self, err);
             };
         } else |err| {
@@ -75,22 +77,21 @@ pub const Listener = struct {
             op.detach(self);
             self.op = null;
         }
-        self.context = null;
     }
 };
 
 test "connect to listener" {
-    var loop = try Loop.init(.{
+    var loop = try io.Loop.init(.{
         .entries = 16,
         .fd_nr = 2,
-        .op_pool = Loop.OpPool.init(testing.allocator),
+        .op_pool = io.Loop.OpPool.init(testing.allocator),
     });
     defer loop.deinit();
 
     const Server = struct {
         const Self = @This();
         conn_count: usize = 0,
-        loop: *Loop,
+        loop: *io.Loop,
 
         fn onConnect(self: *Self, fd_err: anyerror!linux.fd_t) anyerror!void {
             self.conn_count += 1;
@@ -101,8 +102,9 @@ test "connect to listener" {
     var server: Server = .{ .loop = &loop };
 
     const addr: std.net.Address = try std.net.Address.resolveIp("127.0.0.1", 9899);
-    var listener = Listener.init(&loop, addr);
-    try listener.listen(&server, Server.onConnect);
+    var listener: io.tcp.Listener = undefined;
+    //try listener.init(&loop, addr, &server, Server.onConnect);
+    try loop.tcp.listen(&listener, addr, &server, Server.onConnect);
 
     var thr = try std.Thread.spawn(.{}, testConnect, .{addr});
     while (server.conn_count < 1024)
