@@ -39,6 +39,21 @@ metric: struct {
     active_op: usize = 0,
 } = .{},
 
+tcp: Tcp = .{},
+pub const Tcp = struct {
+    pub const Listener = @import("tcp.zig").Listener;
+    pub fn listen(
+        ptr: *@This(),
+        listener: *Listener,
+        addr: std.net.Address,
+        context: anytype,
+        comptime onConnect: *const fn (@TypeOf(context), anyerror!linux.fd_t) anyerror!void,
+    ) !void {
+        const loop: *Loop = @alignCast(@fieldParentPtr("tcp", ptr));
+        try listener.init(loop, addr, context, onConnect);
+    }
+};
+
 pub fn init(opt: Options) !Loop {
     var ring = try linux.IoUring.init(opt.entries, opt.flags);
     errdefer ring.deinit();
@@ -142,6 +157,7 @@ fn ensureUnusedSqes(self: *Loop, count: u32) !void {
     while (self.unusedSqes() < count) {
         // TODO: is it safe to loop here
         _ = try self.ring.submit();
+        // TODO handler signal interrupt
     }
 }
 
@@ -181,7 +197,8 @@ pub fn socket(
 pub fn listen(
     self: *Loop,
     fd: linux.fd_t,
-    addr: std.net.Address,
+    /// Lifetime has to be until cqe complted
+    addr: *std.net.Address,
     opt: std.net.Address.ListenOptions,
     context: anytype,
     comptime onComplete: fn (@TypeOf(context), anyerror!void) anyerror!void,
@@ -484,7 +501,7 @@ test "tcp server" {
         fn onSocket(self: *Self, err_fd: anyerror!linux.fd_t) anyerror!void {
             const fd = try err_fd;
             self.listen_fd = fd;
-            _ = try self.loop.listen(fd, self.addr, .{ .reuse_address = true }, self, onListen);
+            _ = try self.loop.listen(fd, &self.addr, .{ .reuse_address = true }, self, onListen);
         }
 
         fn onListen(self: *Self, maybe_err: anyerror!void) anyerror!void {
