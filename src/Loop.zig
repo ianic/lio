@@ -227,12 +227,12 @@ pub fn listen(
     // error.OperationCanceled.
     if (opt.reuse_address) {
         sqe = try self.ring.setsockopt(0, fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, yes_socket_option);
-        sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_FIXED_FILE;
+        sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
         sqe = try self.ring.setsockopt(0, fd, linux.SOL.SOCKET, linux.SO.REUSEPORT, yes_socket_option);
-        sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_FIXED_FILE;
+        sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
     }
     sqe = try self.ring.bind(0, fd, &addr.any, addr.getOsSockLen(), 0);
-    sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_FIXED_FILE;
+    sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
     sqe = try self.ring.listen(@intFromPtr(op), fd, opt.kernel_backlog, 0);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 
@@ -538,7 +538,6 @@ test "tcp server" {
         listen_fd: ?linux.fd_t = null,
         conn_fd: ?linux.fd_t = null,
         conn_count: usize = 0,
-        listen: bool = false,
 
         fn start(self: *Self) !void {
             _ = try self.loop.socket(self.addr.any.family, linux.SOCK.STREAM, self, onSocket);
@@ -552,7 +551,6 @@ test "tcp server" {
 
         fn onListen(self: *Self, maybe_err: anyerror!void) anyerror!void {
             _ = try maybe_err;
-            self.listen = true;
             _ = try self.loop.accept(self.listen_fd.?, self, onAccept);
         }
 
@@ -579,8 +577,6 @@ test "tcp server" {
     };
 
     try server.start();
-    while (!server.listen) try loop.tickNr(1);
-
     var thr = try std.Thread.spawn(.{}, testSend, .{addr});
     while (server.conn_count < 4) {
         try loop.tickNr(1);
@@ -591,9 +587,14 @@ test "tcp server" {
 }
 
 fn testSend(addr: std.net.Address) void {
-    for (0..4) |n| {
-        var stream = std.net.tcpConnectToAddress(addr) catch unreachable;
+    var n: usize = 0;
+    while (n < 4) {
+        var stream = std.net.tcpConnectToAddress(addr) catch |err| switch (err) {
+            error.ConnectionRefused => continue,
+            else => unreachable,
+        };
         stream.writeAll(&[_]u8{@intCast(n)}) catch unreachable;
         stream.close();
+        n += 1;
     }
 }
