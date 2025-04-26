@@ -69,7 +69,7 @@ pub fn deinit(self: *Loop) void {
 pub fn tickNr(self: *Loop, wait_nr: u32) !void {
     // Push sqe's to the kernel
     _ = try self.ring.submit();
-    try self.drainCqes(wait_nr);
+    try self.processCq(wait_nr);
 }
 
 pub fn tick(self: *Loop) !void {
@@ -87,13 +87,13 @@ pub fn drain(self: *Loop) !void {
 
 /// Process all pending completion queue entries. If there are no pending
 /// cqe's wait for at least wait_nr to be completed.
-fn drainCqes(self: *Loop, wait_nr: u32) !void {
-    var completed: u32 = 0; // number of completed cqe's in this run
-    defer self.ring.cq_advance(completed);
-
-    // Process all pending cqe's
-    var res = try self.peekCqes(wait_nr);
+fn processCq(self: *Loop, wait_nr: u32) !void {
+    var nr: u32 = wait_nr;
     while (true) {
+        var completed: u32 = 0; // number of completed cqe's in this run
+        defer self.ring.cq_advance(completed);
+
+        var res = try self.peekCqes(nr);
         for (res.cqes) |cqe| {
             if (cqe.user_data == 0) {
                 // cqe without Op in userdata
@@ -112,7 +112,7 @@ fn drainCqes(self: *Loop, wait_nr: u32) !void {
             }
         }
         if (!res.hasMore()) break;
-        res = try self.peekCqes(0);
+        nr -|= completed;
     }
 }
 
@@ -120,6 +120,10 @@ const PeekCqesResult = struct {
     cqes: []linux.io_uring_cqe,
     ready: u32,
 
+    /// In the case of the ring overlap there can be more completions at the
+    /// start of the ring. In that case need to peek two times first to get
+    /// those from the end of the cqes list and then to get those from the start
+    /// of the list.
     fn hasMore(self: @This()) bool {
         return self.ready > self.cqes.len;
     }
@@ -212,7 +216,7 @@ pub fn socket(
 pub fn listen(
     self: *Loop,
     fd: linux.fd_t,
-    /// Lifetime has to be until cqe complted
+    /// Lifetime has to be until completion is received
     addr: *std.net.Address,
     opt: std.net.Address.ListenOptions,
     context: anytype,
@@ -235,6 +239,41 @@ pub fn listen(
     sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
     sqe = try self.ring.listen(@intFromPtr(op), fd, opt.kernel_backlog, 0);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
+
+    op.* = .{
+        .context = context,
+        .onComplete = struct {
+            const Context = @TypeOf(context);
+            fn complete(op_: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
+                const ctx: Context = @alignCast(@ptrCast(op_.context orelse return));
+                switch (cqe.err()) {
+                    .SUCCESS => try onComplete(ctx, {}),
+                    else => |errno| try onComplete(ctx, errFromErrno(errno)),
+                }
+            }
+        }.complete,
+    };
+    return op;
+}
+
+pub fn connect(
+    self: *Loop,
+    fd: linux.fd_t,
+    addr: *std.net.Address,
+    timeout: ?*linux.kernel_timespec,
+    context: anytype,
+    comptime onComplete: fn (@TypeOf(context), anyerror!void) anyerror!void,
+) !*Op {
+    try self.ensureUnusedSqes(2);
+    const op = try self.createOp();
+
+    var sqe = try self.ring.connect(@intFromPtr(op), fd, &addr.any, addr.getOsSockLen());
+    sqe.flags |= linux.IOSQE_FIXED_FILE;
+    if (timeout) |t| {
+        sqe.flags |= linux.IOSQE_IO_LINK;
+        sqe = try self.ring.link_timeout(0, t, 0);
+        sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
+    }
 
     op.* = .{
         .context = context,
