@@ -67,87 +67,62 @@ pub fn deinit(self: *Loop) void {
 }
 
 pub fn tickNr(self: *Loop, wait_nr: u32) !void {
-    // Push sqe's to the kernel
-    _ = try self.ring.submit();
-    try self.processCq(wait_nr);
+    try self.processCompletions();
+    _ = try self.ring.submit_and_wait(wait_nr);
+    try self.processCompletions();
+}
+
+fn processCompletions(self: *Loop) !void {
+    if (try self.processReadyCompletions()) _ = try self.processReadyCompletions();
+}
+
+/// Get completions and call operation callback for each completion.
+/// Returns true in the case of overlapping ring.
+///
+/// In the case of the ring overlap there can be more completions at the start
+/// of the ring. In that case need to peek two times first to get those from the
+/// end of the cqes list and then to get those from the start of the list.
+fn processReadyCompletions(self: *Loop) !bool {
+    // peek list of ready cqes
+    var ring = &self.ring;
+    const ready = ring.cq_ready();
+    if (ready == 0) return false;
+    const head = ring.cq.head.* & ring.cq.mask;
+    const tail = @min(ring.cq.cqes.len - head, ready);
+    const cqes = ring.cq.cqes[head..][0..tail];
+
+    // number of completed cqe's in this run
+    var completed: u32 = 0;
+    defer ring.cq_advance(completed);
+
+    for (cqes) |cqe| {
+        if (cqe.user_data == 0) {
+            // cqe without Op in userdata
+            completed += 1;
+            continue;
+        }
+        const op: *Op = @ptrFromInt(cqe.user_data);
+        try op.onComplete(op, self, cqe);
+        // Only advance if not error, will try next time same cqe in the
+        // case of error.
+        completed += 1;
+        if (!flagMore(cqe)) {
+            // Done with operation return it to the pool
+            self.op_pool.destroy(op);
+            self.metric.active_op -= 1;
+        }
+    }
+    return cqes.len < ready;
 }
 
 pub fn tick(self: *Loop) !void {
-    self.tickNr(1) catch |err| switch (err) {
-        error.SignalInterrupt => return,
-        else => return err,
-    };
+    return self.tickNr(1);
 }
 
 /// Tick loop while there is active operations
 pub fn drain(self: *Loop) !void {
     while (self.metric.active_op > 0)
         try self.tick();
-}
-
-/// Process all pending completion queue entries. If there are no pending
-/// cqe's wait for at least wait_nr to be completed.
-fn processCq(self: *Loop, wait_nr: u32) !void {
-    var nr: u32 = wait_nr;
-    while (true) {
-        var completed: u32 = 0; // number of completed cqe's in this run
-        defer self.ring.cq_advance(completed);
-
-        var res = try self.peekCqes(nr);
-        for (res.cqes) |cqe| {
-            if (cqe.user_data == 0) {
-                // cqe without Op in userdata
-                completed += 1;
-                continue;
-            }
-            const op: *Op = @ptrFromInt(cqe.user_data);
-            try op.onComplete(op, self, cqe);
-            // Only advance if not error, will try next time same cqe in the
-            // case of error.
-            completed += 1;
-            if (!flagMore(cqe)) {
-                // Done with operation return it to the pool
-                self.op_pool.destroy(op);
-                self.metric.active_op -= 1;
-            }
-        }
-        if (!res.hasMore()) break;
-        nr -|= completed;
-    }
-}
-
-const PeekCqesResult = struct {
-    cqes: []linux.io_uring_cqe,
-    ready: u32,
-
-    /// In the case of the ring overlap there can be more completions at the
-    /// start of the ring. In that case need to peek two times first to get
-    /// those from the end of the cqes list and then to get those from the start
-    /// of the list.
-    fn hasMore(self: @This()) bool {
-        return self.ready > self.cqes.len;
-    }
-};
-
-fn peekCqes(self: *Loop, wait_nr: u32) !PeekCqesResult {
-    const res = self.peekCqesReady();
-    if (res.cqes.len > 0) return res;
-
-    var ring = &self.ring;
-    if (ring.cq_ring_needs_flush() or wait_nr > 0) {
-        _ = try ring.enter(0, wait_nr, linux.IORING_ENTER_GETEVENTS);
-        return self.peekCqesReady();
-    }
-    return .{ .cqes = &.{}, .ready = 0 };
-}
-
-fn peekCqesReady(self: *Loop) PeekCqesResult {
-    var ring = &self.ring;
-    const ready = ring.cq_ready();
-    const head = ring.cq.head.* & ring.cq.mask;
-
-    const n = @min(ring.cq.cqes.len - head, ready);
-    return .{ .cqes = ring.cq.cqes[head..][0..n], .ready = ready };
 }
 
 fn flagMore(cqe: linux.io_uring_cqe) bool {
