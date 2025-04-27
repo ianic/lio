@@ -113,4 +113,22 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_unit_tests.step);
     test_step.dependOn(&run_exe_unit_tests.step);
+
+    // Build all from test/ path
+    const examples = [_][]const u8{
+        "interrupt",
+    };
+    inline for (examples) |path| {
+        const source_file = "test/" ++ path ++ ".zig";
+        const name = comptime if (std.mem.indexOfScalar(u8, path, '/')) |pos| path[0..pos] else path;
+        const test_exe = b.addExecutable(.{
+            .name = name,
+            .root_source_file = b.path(source_file),
+            .target = target,
+            .optimize = optimize,
+        });
+        test_exe.linkLibC();
+        test_exe.root_module.addImport("iox", lib_mod);
+        b.installArtifact(test_exe);
+    }
 }
