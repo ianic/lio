@@ -13,7 +13,7 @@ pub const Connector = struct {
     callback: *const fn (*Self, anyerror!linux.fd_t) anyerror!void,
     fd: ?linux.fd_t = null, // connected socket
     op: ?*io.Loop.Op = null,
-    connect_timeout: linux.kernel_timespec = .{ .sec = 1, .nsec = 0 },
+    connect_timeout: linux.kernel_timespec = .{ .sec = 10, .nsec = 0 },
 
     pub fn init(
         self: *Self,
@@ -177,7 +177,7 @@ test "connect to listener" {
     };
     var server: Server = .{ .loop = &loop };
 
-    const addr: std.net.Address = try std.net.Address.resolveIp("127.0.0.1", 9899);
+    const addr: std.net.Address = try std.net.Address.resolveIp("127.0.0.1", 9980);
     var listener: io.tcp.Listener = undefined;
     //try listener.init(&loop, addr, &server, Server.onConnect);
     try loop.tcp.listen(&listener, addr, &server, Server.onConnect);
@@ -228,7 +228,7 @@ test "connector" {
         }
     };
     var handler: Handler = .{};
-    const addr: std.net.Address = try std.net.Address.resolveIp("127.0.0.1", 9890);
+    const addr: std.net.Address = try std.net.Address.resolveIp("127.0.0.1", 9981);
     try handler.connector.init(&loop, addr, &handler, Handler.onConnect);
 
     var thr = try std.Thread.spawn(.{}, testListen, .{addr});

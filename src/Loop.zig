@@ -323,6 +323,35 @@ pub fn recv(
     return op;
 }
 
+pub fn send(
+    self: *Loop,
+    fd: linux.fd_t,
+    buffer: []const u8,
+    context: anytype,
+    comptime onComplete: fn (@TypeOf(context), anyerror!u32) anyerror!void,
+) !*Op {
+    try self.ensureUnusedSqes(1);
+    const op = try self.createOp();
+
+    var sqe = try self.ring.send(@intFromPtr(op), fd, buffer, linux.MSG.WAITALL | linux.MSG.NOSIGNAL);
+    sqe.flags |= linux.IOSQE_FIXED_FILE;
+
+    op.* = .{
+        .context = context,
+        .onComplete = struct {
+            const Context = @TypeOf(context);
+            fn complete(op_: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
+                const ctx: Context = @alignCast(@ptrCast(op_.context orelse return));
+                switch (cqe.err()) {
+                    .SUCCESS => try onComplete(ctx, @intCast(cqe.res)),
+                    else => |errno| try onComplete(ctx, errFromErrno(errno)),
+                }
+            }
+        }.complete,
+    };
+    return op;
+}
+
 pub fn close(self: *Loop, fd: linux.fd_t) !void {
     try self.ensureUnusedSqes(1);
     var sqe = try self.ring.close_direct(0, @intCast(fd));
@@ -584,7 +613,7 @@ test "tcp server" {
         }
     };
 
-    const addr: std.net.Address = try std.net.Address.resolveIp("127.0.0.1", 9898);
+    const addr: std.net.Address = try std.net.Address.resolveIp("127.0.0.1", 9990);
     var server: Server = .{
         .loop = &loop,
         .addr = addr,
@@ -611,4 +640,8 @@ fn testSend(addr: std.net.Address) void {
         stream.close();
         n += 1;
     }
+}
+
+test "size" {
+    try testing.expectEqual(16, @sizeOf(Op));
 }
