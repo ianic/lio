@@ -22,7 +22,7 @@ pub fn main() !void {
     var loop = try io.Loop.init(.{
         .entries = 16,
         .fd_nr = 2,
-        .op_pool = io.Loop.OpPool.init(gpa),
+        .op_list = io.Loop.OpList.init(gpa),
         .flags = linux.IORING_SETUP_SINGLE_ISSUER, //| linux.IORING_SETUP_SQPOLL,
     });
     defer loop.deinit();

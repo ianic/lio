@@ -4,7 +4,7 @@ const linux = std.os.linux;
 const testing = std.testing;
 
 const errFromErrno = @import("errno.zig").toError;
-pub const OpPool = std.heap.MemoryPool(Op);
+pub const OpList = std.ArrayList(Op);
 
 pub const Options = struct {
     /// Number of submission queue entries
@@ -15,16 +15,21 @@ pub const Options = struct {
     fd_nr: u16,
     /// Provided pool operations pool.
     /// Operation is submitted but not jet completed task; in kernel task.
-    op_pool: OpPool,
+    op_list: OpList,
 };
 
 pub const Op = struct {
-    context: ?*anyopaque,
-    onComplete: *const fn (*Op, *Loop, linux.io_uring_cqe) anyerror!void,
+    context: ?*anyopaque = null,
+    onComplete: *const fn (*Op, *Loop, linux.io_uring_cqe) anyerror!void = noopCallback,
 
-    pub fn detach(self: *Op, context: *anyopaque) void {
-        assert(self.context.? == context);
-        self.context = null;
+    const noopCallback = struct {
+        fn noop(_: *Op, _: *Loop, _: linux.io_uring_cqe) anyerror!void {}
+    }.noop;
+
+    /// Replace callback with noop callback. Enables ptr to be destroyed.
+    fn detach(self: *Op, context: *anyopaque) void {
+        assert(self.context == context);
+        self.onComplete = noopCallback;
     }
 };
 
@@ -32,9 +37,11 @@ const Loop = @This();
 
 const yes_value: u32 = 1;
 const yes_socket_option = std.mem.asBytes(&yes_value);
+const no_user_data: u64 = std.math.maxInt(u64);
 
 ring: linux.IoUring,
-op_pool: OpPool = undefined,
+op_list: OpList = undefined,
+op_idx: usize = std.math.maxInt(usize),
 metric: struct {
     active_op: usize = 0,
 } = .{},
@@ -58,11 +65,11 @@ pub fn init(opt: Options) !Loop {
     var ring = try linux.IoUring.init(opt.entries, opt.flags);
     errdefer ring.deinit();
     try ring.register_files_sparse(opt.fd_nr);
-    return .{ .ring = ring, .op_pool = opt.op_pool };
+    return .{ .ring = ring, .op_list = opt.op_list };
 }
 
 pub fn deinit(self: *Loop) void {
-    self.op_pool.deinit();
+    self.op_list.deinit();
     self.ring.deinit();
 }
 
@@ -96,19 +103,20 @@ fn processReadyCompletions(self: *Loop) !bool {
     defer ring.cq_advance(completed);
 
     for (cqes) |cqe| {
-        if (cqe.user_data == 0) {
+        if (cqe.user_data == no_user_data) {
             // cqe without Op in userdata
             completed += 1;
             continue;
         }
-        const op: *Op = @ptrFromInt(cqe.user_data);
+        const op: *Op = &self.op_list.items[cqe.user_data];
+        // std.debug.print("op: {} cqe: {}\n", .{ op, cqe });
         try op.onComplete(op, self, cqe);
         // Only advance if not error, will try next time same cqe in the
         // case of error.
         completed += 1;
         if (!flagMore(cqe)) {
-            // Done with operation return it to the pool
-            self.op_pool.destroy(op);
+            // Done with operation mark it as unused
+            op.* = .{};
             self.metric.active_op -= 1;
         }
     }
@@ -155,10 +163,33 @@ fn ensureUnusedSqes(self: *Loop, count: u32) !void {
     }
 }
 
-fn createOp(self: *Loop) !*Op {
-    const op = try self.op_pool.create();
+fn getOp(self: *Loop) !struct { *Op, usize } {
+    const op_count = self.op_list.items.len;
+    if (self.metric.active_op < op_count) {
+        // find unused op with higher index than ths last one
+        for (self.op_idx + 1..op_count) |idx| {
+            const op = &self.op_list.items[idx];
+            if (op.context == null) {
+                self.metric.active_op += 1;
+                self.op_idx = idx;
+                return .{ op, idx };
+            }
+        }
+        // find unused from start of the list
+        for (0..@min(self.op_idx + 1, op_count)) |idx| {
+            const op = &self.op_list.items[idx];
+            if (op.context == null) {
+                self.metric.active_op += 1;
+                self.op_idx = idx;
+                return .{ op, idx };
+            }
+        }
+    }
+    try self.op_list.append(.{});
     self.metric.active_op += 1;
-    return op;
+    const idx = self.op_list.items.len - 1;
+    self.op_idx = idx;
+    return .{ &self.op_list.items[idx], idx };
 }
 
 pub fn socket(
@@ -167,10 +198,10 @@ pub fn socket(
     socket_type: u32,
     context: anytype,
     comptime onComplete: fn (@TypeOf(context), anyerror!linux.fd_t) anyerror!void,
-) !*Op {
+) !usize {
     try self.ensureUnusedSqes(1);
-    const op = try self.createOp();
-    _ = try self.ring.socket_direct_alloc(@intFromPtr(op), domain, socket_type, 0, 0);
+    const op, const idx = try self.getOp();
+    _ = try self.ring.socket_direct_alloc(idx, domain, socket_type, 0, 0);
 
     op.* = .{
         .context = context,
@@ -185,7 +216,7 @@ pub fn socket(
             }
         }.complete,
     };
-    return op;
+    return idx;
 }
 
 pub fn listen(
@@ -196,23 +227,23 @@ pub fn listen(
     opt: std.net.Address.ListenOptions,
     context: anytype,
     comptime onComplete: fn (@TypeOf(context), anyerror!void) anyerror!void,
-) !*Op {
+) !usize {
     try self.ensureUnusedSqes(if (opt.reuse_address) 4 else 2);
-    const op = try self.createOp();
+    const op, const idx = try self.getOp();
     var sqe: *linux.io_uring_sqe = undefined;
 
     // Hardlink ensures that the last operation will get meaningful error. With
     // (soft)link in the case of error in bind onComplete will always get
     // error.OperationCanceled.
     if (opt.reuse_address) {
-        sqe = try self.ring.setsockopt(0, fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, yes_socket_option);
+        sqe = try self.ring.setsockopt(no_user_data, fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, yes_socket_option);
         sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
-        sqe = try self.ring.setsockopt(0, fd, linux.SOL.SOCKET, linux.SO.REUSEPORT, yes_socket_option);
+        sqe = try self.ring.setsockopt(no_user_data, fd, linux.SOL.SOCKET, linux.SO.REUSEPORT, yes_socket_option);
         sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
     }
-    sqe = try self.ring.bind(0, fd, &addr.any, addr.getOsSockLen(), 0);
+    sqe = try self.ring.bind(no_user_data, fd, &addr.any, addr.getOsSockLen(), 0);
     sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
-    sqe = try self.ring.listen(@intFromPtr(op), fd, opt.kernel_backlog, 0);
+    sqe = try self.ring.listen(idx, fd, opt.kernel_backlog, 0);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 
     op.* = .{
@@ -228,7 +259,7 @@ pub fn listen(
             }
         }.complete,
     };
-    return op;
+    return idx;
 }
 
 pub fn connect(
@@ -238,15 +269,15 @@ pub fn connect(
     timeout: ?*linux.kernel_timespec,
     context: anytype,
     comptime onComplete: fn (@TypeOf(context), anyerror!void) anyerror!void,
-) !*Op {
+) !usize {
     try self.ensureUnusedSqes(2);
-    const op = try self.createOp();
+    const op, const idx = try self.getOp();
 
-    var sqe = try self.ring.connect(@intFromPtr(op), fd, &addr.any, addr.getOsSockLen());
+    var sqe = try self.ring.connect(idx, fd, &addr.any, addr.getOsSockLen());
     sqe.flags |= linux.IOSQE_FIXED_FILE;
     if (timeout) |t| {
         sqe.flags |= linux.IOSQE_IO_LINK;
-        sqe = try self.ring.link_timeout(0, t, 0);
+        sqe = try self.ring.link_timeout(no_user_data, t, 0);
         sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
     }
 
@@ -263,7 +294,7 @@ pub fn connect(
             }
         }.complete,
     };
-    return op;
+    return idx;
 }
 
 pub fn accept(
@@ -271,11 +302,11 @@ pub fn accept(
     fd: linux.fd_t,
     context: anytype,
     comptime onComplete: fn (@TypeOf(context), anyerror!linux.fd_t) anyerror!void,
-) !*Op {
+) !usize {
     try self.ensureUnusedSqes(1);
-    const op = try self.createOp();
+    const op, const idx = try self.getOp();
 
-    var sqe = try self.ring.accept_direct(@intFromPtr(op), fd, null, null, 0);
+    var sqe = try self.ring.accept_direct(idx, fd, null, null, 0);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 
     op.* = .{
@@ -291,7 +322,7 @@ pub fn accept(
             }
         }.complete,
     };
-    return op;
+    return idx;
 }
 
 pub fn recv(
@@ -300,11 +331,11 @@ pub fn recv(
     buffer: []u8,
     context: anytype,
     comptime onComplete: fn (@TypeOf(context), anyerror!u32) anyerror!void,
-) !*Op {
+) !usize {
     try self.ensureUnusedSqes(1);
-    const op = try self.createOp();
+    const op, const idx = try self.getOp();
 
-    var sqe = try self.ring.recv(@intFromPtr(op), fd, .{ .buffer = buffer }, 0);
+    var sqe = try self.ring.recv(idx, fd, .{ .buffer = buffer }, 0);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 
     op.* = .{
@@ -320,7 +351,7 @@ pub fn recv(
             }
         }.complete,
     };
-    return op;
+    return idx;
 }
 
 pub fn send(
@@ -329,11 +360,11 @@ pub fn send(
     buffer: []const u8,
     context: anytype,
     comptime onComplete: fn (@TypeOf(context), anyerror!u32) anyerror!void,
-) !*Op {
+) !usize {
     try self.ensureUnusedSqes(1);
-    const op = try self.createOp();
+    const op, const idx = try self.getOp();
 
-    var sqe = try self.ring.send(@intFromPtr(op), fd, buffer, linux.MSG.WAITALL | linux.MSG.NOSIGNAL);
+    var sqe = try self.ring.send(idx, fd, buffer, linux.MSG.WAITALL | linux.MSG.NOSIGNAL);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 
     op.* = .{
@@ -349,26 +380,40 @@ pub fn send(
             }
         }.complete,
     };
-    return op;
+    return idx;
 }
 
 pub fn close(self: *Loop, fd: linux.fd_t) !void {
     try self.ensureUnusedSqes(1);
-    var sqe = try self.ring.close_direct(0, @intCast(fd));
+    var sqe = try self.ring.close_direct(no_user_data, @intCast(fd));
     sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
 }
 
-pub fn cancel(self: *Loop, op_to_cancel: *Op) !void {
+pub fn cancel(self: *Loop, idx: usize) !void {
     try self.ensureUnusedSqes(1);
-    var sqe = try self.ring.cancel(0, @intFromPtr(op_to_cancel), 0);
+    var sqe = try self.ring.cancel(no_user_data, idx, 0);
     sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
+}
+
+pub fn detach(self: *Loop, op_idx: usize, ctx: *anyopaque) void {
+    const op = &self.op_list.items[op_idx];
+    if (op.context) |op_ctx| if (op_ctx == ctx) {
+        op.detach(ctx);
+    };
+}
+
+pub fn cancelOps(self: *Loop, ctx: *anyopaque) !void {
+    for (self.op_list.items, 0..) |*op, idx| if (op.context) |op_ctx| if (op_ctx == ctx) {
+        op.detach(ctx);
+        try self.cancel(idx);
+    };
 }
 
 test "socket" {
     var loop = try Loop.init(.{
         .entries = 1,
         .fd_nr = 2,
-        .op_pool = std.heap.MemoryPool(Op).init(testing.allocator),
+        .op_list = OpList.init(testing.allocator),
     });
     defer loop.deinit();
 
@@ -415,7 +460,7 @@ test "socket" {
         try testing.expectEqual(ctx.err.?, error.FileTableOverflow);
     }
     { // return one used fd to the kernel
-        _ = try loop.ring.close_direct(0, @intCast(used_fd));
+        _ = try loop.ring.close_direct(no_user_data, @intCast(used_fd));
         try loop.tickNr(1);
     }
     { // success
@@ -431,7 +476,7 @@ test "error in callback, should not advance cq ring" {
     var loop = try Loop.init(.{
         .entries = 1,
         .fd_nr = 2,
-        .op_pool = OpPool.init(testing.allocator),
+        .op_list = OpList.init(testing.allocator),
     });
     defer loop.deinit();
 
@@ -453,18 +498,19 @@ test "error in callback, should not advance cq ring" {
 
     { // error in callback handler, cqe will be retried
         const op = try loop.socket(domain, socket_type, &ctx, Ctx.onSocket);
+        try testing.expectEqual(1, loop.metric.active_op);
         try testing.expectEqual(0, loop.ring.cq_ready());
         try testing.expectError(error.OnSocketTestError, loop.tickNr(1));
         try testing.expectEqual(1, loop.ring.cq_ready());
         try testing.expectEqual(1, ctx.call_count);
-        op.detach(&ctx);
+        loop.detach(op, &ctx);
     }
     { // retrying cqe, now succeeds
-        try testing.expect(loop.op_pool.free_list == null);
         try testing.expectEqual(1, loop.ring.cq_ready());
+        try testing.expectEqual(1, loop.metric.active_op);
         try loop.tickNr(0);
+        try testing.expectEqual(0, loop.metric.active_op);
         try testing.expectEqual(0, loop.ring.cq_ready());
-        try testing.expect(loop.op_pool.free_list != null);
         try testing.expectEqual(1, ctx.call_count);
     }
 }
@@ -473,7 +519,7 @@ test "ensure unused sqes pushes sqes to the kernel" {
     var loop = try Loop.init(.{
         .entries = 2,
         .fd_nr = 2,
-        .op_pool = OpPool.init(testing.allocator),
+        .op_list = OpList.init(testing.allocator),
     });
     defer loop.deinit();
 
@@ -499,14 +545,14 @@ test "ensure unused sqes pushes sqes to the kernel" {
     _ = try loop.socket(domain, socket_type, &ctx, Ctx.onSocket);
 }
 
-test "OutOfMemory on operation pool full" {
+test "OutOfMemory on operations list unable to grow" {
     var fba_buf: [@sizeOf(Op) * 10]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
 
     var loop = try Loop.init(.{
         .entries = 2,
         .fd_nr = 2,
-        .op_pool = std.heap.MemoryPool(Op).init(fba.allocator()),
+        .op_list = OpList.init(fba.allocator()),
     });
     defer loop.deinit();
 
@@ -539,7 +585,7 @@ test "listen (linked request) should return meaningful error" {
     var loop = try Loop.init(.{
         .entries = 4,
         .fd_nr = 2,
-        .op_pool = std.heap.MemoryPool(Op).init(testing.allocator),
+        .op_list = OpList.init(testing.allocator),
     });
     defer loop.deinit();
 
@@ -568,7 +614,7 @@ test "tcp server" {
     var loop = try Loop.init(.{
         .entries = 16,
         .fd_nr = 2,
-        .op_pool = OpPool.init(testing.allocator),
+        .op_list = OpList.init(testing.allocator),
     });
     defer loop.deinit();
 

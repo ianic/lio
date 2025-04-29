@@ -21,7 +21,7 @@ pub fn main() !void {
     var loop = try io.Loop.init(.{
         .entries = 16,
         .fd_nr = 16,
-        .op_pool = io.Loop.OpPool.init(gpa),
+        .op_list = io.Loop.OpList.init(gpa),
     });
     defer loop.deinit();
 
@@ -65,17 +65,14 @@ const Connection = struct {
     buffer: [1024 * 64]u8 = undefined,
     head: u32 = 0,
     tail: u32 = 0,
-    recv_op: ?*io.Loop.Op = null,
-    send_op: ?*io.Loop.Op = null,
 
     fn recv(self: *Self) !void {
         self.head = 0;
         self.tail = 0;
-        self.recv_op = try self.loop.recv(self.fd, &self.buffer, self, onRecv);
+        _ = try self.loop.recv(self.fd, &self.buffer, self, onRecv);
     }
 
     fn onRecv(self: *Self, n_err: anyerror!u32) anyerror!void {
-        self.recv_op = null;
         const n = n_err catch |err| {
             log.debug("recv {}", .{err});
             switch (err) {
@@ -93,11 +90,10 @@ const Connection = struct {
     }
 
     fn send(self: *Self) !void {
-        self.send_op = try self.loop.send(self.fd, self.buffer[self.head..self.tail], self, onSend);
+        _ = try self.loop.send(self.fd, self.buffer[self.head..self.tail], self, onSend);
     }
 
     fn onSend(self: *Self, n_err: anyerror!u32) anyerror!void {
-        self.send_op = null;
         self.head += n_err catch |err| {
             log.debug("send {}", .{err});
             switch (err) {
@@ -117,16 +113,7 @@ const Connection = struct {
     }
 
     fn close(self: *Self) !void {
-        if (self.send_op) |op| {
-            try self.loop.cancel(op);
-            op.detach(self);
-            self.send_op = null;
-        }
-        if (self.recv_op) |op| {
-            try self.loop.cancel(op);
-            op.detach(self);
-            self.recv_op = null;
-        }
+        try self.loop.cancelOps(self);
         try self.loop.close(self.fd);
         self.allocator.destroy(self);
     }

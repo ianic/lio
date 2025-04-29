@@ -12,7 +12,6 @@ pub const Connector = struct {
     context: *anyopaque,
     callback: *const fn (*Self, anyerror!linux.fd_t) anyerror!void,
     fd: ?linux.fd_t = null, // connected socket
-    op: ?*io.Loop.Op = null,
     connect_timeout: linux.kernel_timespec = .{ .sec = 10, .nsec = 0 },
 
     pub fn init(
@@ -38,19 +37,17 @@ pub const Connector = struct {
     }
 
     pub fn connect(self: *Self) !void {
-        assert(self.op == null);
         if (self.fd) |fd| {
-            self.op = try self.loop.connect(fd, &self.addr, &self.connect_timeout, self, onConnect);
+            _ = try self.loop.connect(fd, &self.addr, &self.connect_timeout, self, onConnect);
         } else {
-            self.op = try self.loop.socket(self.addr.any.family, linux.SOCK.STREAM, self, onSocket);
+            _ = try self.loop.socket(self.addr.any.family, linux.SOCK.STREAM, self, onSocket);
         }
     }
 
     fn onSocket(self: *Self, fd_err: anyerror!linux.fd_t) anyerror!void {
-        self.op = null;
         if (fd_err) |fd| {
             self.fd = fd;
-            self.op = self.loop.connect(fd, &self.addr, &self.connect_timeout, self, onConnect) catch |err| {
+            _ = self.loop.connect(fd, &self.addr, &self.connect_timeout, self, onConnect) catch |err| {
                 return try self.callback(self, err);
             };
         } else |err| {
@@ -59,7 +56,6 @@ pub const Connector = struct {
     }
 
     fn onConnect(self: *Self, _err: anyerror!void) anyerror!void {
-        self.op = null;
         if (_err) |_| {
             try self.callback(self, self.fd.?);
         } else |err| {
@@ -72,11 +68,7 @@ pub const Connector = struct {
             _ = try self.loop.close(fd);
             self.fd = null;
         }
-        if (self.op) |op| {
-            try self.loop.cancel(op);
-            op.detach(self);
-            self.op = null;
-        }
+        try self.loop.cancelOps(self);
     }
 };
 
@@ -88,7 +80,6 @@ pub const Listener = struct {
     context: *anyopaque,
     onConnect: *const fn (*Self, anyerror!linux.fd_t) anyerror!void,
     fd: ?linux.fd_t = null, // listening socket
-    op: ?*io.Loop.Op = null, // accept operation
 
     pub fn init(
         self: *Self,
@@ -132,13 +123,12 @@ pub const Listener = struct {
     }
 
     fn onAccept(self: *Self, fd_err: anyerror!linux.fd_t) anyerror!void {
-        self.op = null;
         try self.onConnect(self, fd_err);
         try self.accept();
     }
 
     fn accept(self: *Self) !void {
-        self.op = self.loop.accept(self.fd.?, self, onAccept) catch |err| {
+        _ = self.loop.accept(self.fd.?, self, onAccept) catch |err| {
             return try self.onConnect(self, err);
         };
     }
@@ -148,11 +138,7 @@ pub const Listener = struct {
             _ = try self.loop.close(fd);
             self.fd = null;
         }
-        if (self.op) |op| {
-            try self.loop.cancel(op);
-            op.detach(self);
-            self.op = null;
-        }
+        try self.loop.cancelOps(self);
     }
 };
 
@@ -160,7 +146,7 @@ test "connect to listener" {
     var loop = try io.Loop.init(.{
         .entries = 16,
         .fd_nr = 2,
-        .op_pool = io.Loop.OpPool.init(testing.allocator),
+        .op_list = io.Loop.OpList.init(testing.allocator),
     });
     defer loop.deinit();
 
@@ -208,7 +194,7 @@ test "connector" {
     var loop = try io.Loop.init(.{
         .entries = 16,
         .fd_nr = 2,
-        .op_pool = io.Loop.OpPool.init(testing.allocator),
+        .op_list = io.Loop.OpList.init(testing.allocator),
     });
     defer loop.deinit();
 
