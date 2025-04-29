@@ -6,6 +6,7 @@ const io = @import("iox");
 const mem = std.mem;
 
 const log = std.log.scoped(.main);
+pub const std_options = std.Options{ .log_level = .debug };
 
 // Connect with:
 // $ nc -w0 localhost 9899
@@ -19,8 +20,8 @@ pub fn main() !void {
     const gpa = debug_allocator.allocator();
 
     var loop = try io.Loop.init(.{
-        .entries = 16,
-        .fd_nr = 16,
+        .entries = 4096,
+        .fd_nr = 1024,
         .op_list = io.Loop.OpList.init(gpa),
     });
     defer loop.deinit();
@@ -49,12 +50,17 @@ pub fn main() !void {
     var listener: io.tcp.Listener = undefined;
     try loop.tcp.listen(&listener, addr, &server, Server.onConnect);
 
-    while (true)
-        try loop.tick();
+    while (true) {
+        try loop.runFor(1000);
+        log.debug("run: {} bytes: {} MB: {}", .{ loop.tick_timer, bytes, bytes / 1000_000 });
+        bytes = 0;
+    }
 
     try listener.close();
     try loop.drain();
 }
+
+var bytes: usize = 0;
 
 const Connection = struct {
     const Self = @This();
@@ -83,7 +89,8 @@ const Connection = struct {
             }
             return try self.close();
         };
-        log.debug("recv {}", .{n});
+        // log.debug("recv {}", .{n});
+        bytes += n;
         if (n == 0) return try self.close();
         self.tail = n;
         try self.send();
@@ -113,8 +120,8 @@ const Connection = struct {
     }
 
     fn close(self: *Self) !void {
-        try self.loop.cancelOps(self);
         try self.loop.close(self.fd);
+        try self.loop.detach(self);
         self.allocator.destroy(self);
     }
 };

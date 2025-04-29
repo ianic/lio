@@ -46,8 +46,9 @@ pub fn main() !void {
 
     try loop.tcp.listen(&listener, addr, &server, Server.onConnect);
 
-    var thr = try std.Thread.spawn(.{}, connect, .{addr});
+    //var thr = try std.Thread.spawn(.{}, connect, .{addr});
     while (server.conn_count < 1024) {
+        log.debug("loop tick", .{});
         loop.tick() catch |err| {
             log.debug("tick err: {}", .{err});
             switch (err) {
@@ -58,7 +59,7 @@ pub fn main() !void {
         if (getSignal()) |sig|
             if (sig == posix.SIG.TERM) break;
     }
-    thr.join();
+    //thr.join();
 
     try listener.close();
     log.debug("done", .{});
@@ -85,8 +86,8 @@ fn setSignalHandler() void {
         .handler = .{
             .handler = struct {
                 fn wrapper(sig: c_int) callconv(.C) void {
-                    log.debug("signal received {}", .{sig});
                     signal.store(sig, .release);
+                    log.debug("signal received {}", .{sig});
                 }
             }.wrapper,
         },

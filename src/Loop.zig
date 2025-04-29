@@ -38,6 +38,7 @@ const Loop = @This();
 const yes_value: u32 = 1;
 const yes_socket_option = std.mem.asBytes(&yes_value);
 const no_user_data: u64 = std.math.maxInt(u64);
+const timer_user_data: u64 = no_user_data - 1;
 
 ring: linux.IoUring,
 op_list: OpList = undefined,
@@ -45,6 +46,8 @@ op_idx: usize = std.math.maxInt(usize),
 metric: struct {
     active_op: usize = 0,
 } = .{},
+tick_timer_ts: linux.kernel_timespec = .{ .sec = 0, .nsec = 0 },
+tick_timer: usize = 0,
 
 //TODO: add all tcp structs or remove
 tcp: Tcp = .{},
@@ -75,7 +78,6 @@ pub fn deinit(self: *Loop) void {
 }
 
 pub fn tickNr(self: *Loop, wait_nr: u32) !void {
-    try self.processCompletions();
     _ = try self.ring.submit_and_wait(wait_nr);
     try self.processCompletions();
 }
@@ -109,15 +111,22 @@ fn processReadyCompletions(self: *Loop) !bool {
             completed += 1;
             continue;
         }
-        const op: *Op = &self.op_list.items[cqe.user_data];
-        // std.debug.print("op: {} cqe: {}\n", .{ op, cqe });
+        if (cqe.user_data == timer_user_data) {
+            self.tick_timer +%= 1;
+            completed += 1;
+            continue;
+        }
+        var op: *Op = &self.op_list.items[cqe.user_data];
+        //std.debug.print("op: {} cqe: {}\n", .{ op, cqe });
         try op.callback(op, self, cqe);
         // Only advance if not error, will try next time same cqe in the
         // case of error.
         completed += 1;
         if (!flagMore(cqe)) {
+            // TODO: list is moved
+            op = &self.op_list.items[cqe.user_data];
             // Done with operation mark it as unused
-            op.* = .{};
+            op.ptr = null;
             self.metric.active_op -= 1;
         }
     }
@@ -126,6 +135,18 @@ fn processReadyCompletions(self: *Loop) !bool {
 
 pub fn tick(self: *Loop) !void {
     return self.tickNr(1);
+}
+
+pub fn runFor(self: *Loop, ms: u64) !void {
+    const sec = ms / std.time.ms_per_s;
+    const nsec = (ms - sec * std.time.ms_per_s) * std.time.ns_per_ms;
+    self.tick_timer_ts = .{ .sec = @intCast(sec), .nsec = @intCast(nsec) };
+    try self.tickTimer(&self.tick_timer_ts);
+    const current = self.tick_timer;
+    while (current == self.tick_timer) {
+        _ = try self.ring.submit_and_wait(1);
+        try self.processCompletions();
+    }
 }
 
 /// Tick loop while there is active operations
@@ -400,24 +421,32 @@ pub fn close(self: *Loop, fd: linux.fd_t) RingSubmitError!void {
     sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
 }
 
+/// Cancel single operation by index.
 pub fn cancel(self: *Loop, idx: usize) RingSubmitError!void {
     try self.ensureSubmissionQueueCapacity(1);
     var sqe = self.ring.cancel(no_user_data, idx, 0) catch unreachable;
     sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
 }
 
-pub fn detach(self: *Loop, op_idx: usize, ctx: *anyopaque) void {
+/// Detach single operation by index.
+pub fn detachOp(self: *Loop, op_idx: usize, ctx: *anyopaque) void {
     const op = &self.op_list.items[op_idx];
-    if (op.ptr) |op_ctx| if (op_ctx == ctx) {
+    if (op.ptr) |op_ptr| if (op_ptr == ctx) {
         op.detach(ctx);
     };
 }
 
-pub fn cancelOps(self: *Loop, ctx: *anyopaque) RingSubmitError!void {
-    for (self.op_list.items, 0..) |*op, idx| if (op.ptr) |op_ctx| if (op_ctx == ctx) {
+/// Detach all operations for some context and cancel any pending operations.
+pub fn detach(self: *Loop, ctx: *anyopaque) RingSubmitError!void {
+    for (self.op_list.items, 0..) |*op, idx| if (op.ptr) |op_ptr| if (op_ptr == ctx) {
         op.detach(ctx);
         try self.cancel(idx);
     };
+}
+
+fn tickTimer(self: *Loop, ts: *linux.kernel_timespec) RingSubmitError!void {
+    try self.ensureSubmissionQueueCapacity(1);
+    _ = self.ring.timeout(timer_user_data, ts, 0, 0) catch unreachable;
 }
 
 test "socket" {
@@ -514,7 +543,7 @@ test "error in callback, should not advance cq ring" {
         try testing.expectError(error.OnSocketTestError, loop.tickNr(1));
         try testing.expectEqual(1, loop.ring.cq_ready());
         try testing.expectEqual(1, ctx.call_count);
-        loop.detach(op, &ctx);
+        loop.detachOp(op, &ctx);
     }
     { // retrying cqe, now succeeds
         try testing.expectEqual(1, loop.ring.cq_ready());

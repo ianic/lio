@@ -56,8 +56,12 @@ pub const Connector = struct {
     }
 
     fn onConnect(self: *Self, _err: anyerror!void) anyerror!void {
+        const fd = self.fd.?;
+        errdefer self.loop.close(fd) catch {};
         if (_err) |_| {
-            try self.callback(self, self.fd.?);
+            // Transfer fd ownership to the callback.
+            self.fd = null;
+            try self.callback(self, fd);
         } else |err| {
             try self.callback(self, err);
         }
@@ -138,7 +142,7 @@ pub const Listener = struct {
             _ = try self.loop.close(fd);
             self.fd = null;
         }
-        try self.loop.cancelOps(self);
+        try self.loop.detach(self);
     }
 };
 
