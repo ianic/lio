@@ -19,8 +19,8 @@ pub const Options = struct {
 };
 
 pub const Op = struct {
-    context: ?*anyopaque = null,
-    onComplete: *const fn (*Op, *Loop, linux.io_uring_cqe) anyerror!void = noopCallback,
+    ptr: ?*anyopaque = null,
+    callback: *const fn (*Op, *Loop, linux.io_uring_cqe) anyerror!void = noopCallback,
 
     const noopCallback = struct {
         fn noop(_: *Op, _: *Loop, _: linux.io_uring_cqe) anyerror!void {}
@@ -28,8 +28,8 @@ pub const Op = struct {
 
     /// Replace callback with noop callback. Enables ptr to be destroyed.
     fn detach(self: *Op, context: *anyopaque) void {
-        assert(self.context == context);
-        self.onComplete = noopCallback;
+        assert(self.ptr == context);
+        self.callback = noopCallback;
     }
 };
 
@@ -46,17 +46,18 @@ metric: struct {
     active_op: usize = 0,
 } = .{},
 
+//TODO: add all tcp structs or remove
 tcp: Tcp = .{},
 pub const Tcp = struct {
     pub const Listener = @import("tcp.zig").Listener;
     pub fn listen(
-        ptr: *@This(),
+        self: *@This(),
         listener: *Listener,
         addr: std.net.Address,
         context: anytype,
         comptime onConnect: *const fn (@TypeOf(context), anyerror!linux.fd_t) anyerror!void,
     ) !void {
-        const loop: *Loop = @alignCast(@fieldParentPtr("tcp", ptr));
+        const loop: *Loop = @alignCast(@fieldParentPtr("tcp", self));
         try listener.init(loop, addr, context, onConnect);
     }
 };
@@ -110,7 +111,7 @@ fn processReadyCompletions(self: *Loop) !bool {
         }
         const op: *Op = &self.op_list.items[cqe.user_data];
         // std.debug.print("op: {} cqe: {}\n", .{ op, cqe });
-        try op.onComplete(op, self, cqe);
+        try op.callback(op, self, cqe);
         // Only advance if not error, will try next time same cqe in the
         // case of error.
         completed += 1;
@@ -143,33 +144,47 @@ pub fn sqSpaceLeft(self: *Loop) u32 {
     return @as(u32, @intCast(self.ring.sq.sqes.len)) - self.ring.sq_ready();
 }
 
-fn ensureUnusedSqes(self: *Loop, count: u32) !void {
+pub const RingSubmitError = error{
+    SystemResources,
+    FileDescriptorInvalid,
+    FileDescriptorInBadState,
+    CompletionQueueOvercommitted,
+    SubmissionQueueEntryInvalid,
+    BufferInvalid,
+    RingShuttingDown,
+    OpcodeNotSupported,
+    Unexpected,
+};
+
+pub const SubmitError = RingSubmitError || error{OutOfMemory};
+
+fn ensureSubmissionQueueCapacity(self: *Loop, count: u32) RingSubmitError!void {
     assert(count <= self.ring.sq.sqes.len);
     while (self.sqSpaceLeft() < count) {
         _ = self.ring.submit() catch |err| switch (err) {
             error.SignalInterrupt => continue,
 
-            error.SystemResources,
-            error.FileDescriptorInvalid,
-            error.FileDescriptorInBadState,
-            error.CompletionQueueOvercommitted,
-            error.SubmissionQueueEntryInvalid,
-            error.BufferInvalid,
-            error.RingShuttingDown,
-            error.OpcodeNotSupported,
-            error.Unexpected,
-            => return err,
+            error.SystemResources => return error.SystemResources,
+            error.FileDescriptorInvalid => return error.FileDescriptorInvalid,
+            error.FileDescriptorInBadState => return error.FileDescriptorInBadState,
+            error.CompletionQueueOvercommitted => return error.CompletionQueueOvercommitted,
+            error.SubmissionQueueEntryInvalid => return error.SubmissionQueueEntryInvalid,
+            error.BufferInvalid => return error.BufferInvalid,
+            error.RingShuttingDown => return error.RingShuttingDown,
+            error.OpcodeNotSupported => return error.OpcodeNotSupported,
+            error.Unexpected => return error.Unexpected,
         };
     }
 }
 
-fn getOp(self: *Loop) !struct { *Op, usize } {
+/// Returns Op and index to that Op in op_list.items
+fn getOp(self: *Loop) error{OutOfMemory}!struct { *Op, usize } {
     const op_count = self.op_list.items.len;
     if (self.metric.active_op < op_count) {
         // find unused op with higher index than ths last one
         for (self.op_idx + 1..op_count) |idx| {
             const op = &self.op_list.items[idx];
-            if (op.context == null) {
+            if (op.ptr == null) {
                 self.metric.active_op += 1;
                 self.op_idx = idx;
                 return .{ op, idx };
@@ -178,7 +193,7 @@ fn getOp(self: *Loop) !struct { *Op, usize } {
         // find unused from start of the list
         for (0..@min(self.op_idx + 1, op_count)) |idx| {
             const op = &self.op_list.items[idx];
-            if (op.context == null) {
+            if (op.ptr == null) {
                 self.metric.active_op += 1;
                 self.op_idx = idx;
                 return .{ op, idx };
@@ -186,8 +201,8 @@ fn getOp(self: *Loop) !struct { *Op, usize } {
         }
     }
     try self.op_list.append(.{});
-    self.metric.active_op += 1;
     const idx = self.op_list.items.len - 1;
+    self.metric.active_op += 1;
     self.op_idx = idx;
     return .{ &self.op_list.items[idx], idx };
 }
@@ -198,23 +213,24 @@ pub fn socket(
     socket_type: u32,
     context: anytype,
     comptime onComplete: fn (@TypeOf(context), anyerror!linux.fd_t) anyerror!void,
-) !usize {
-    try self.ensureUnusedSqes(1);
+) SubmitError!usize {
     const op, const idx = try self.getOp();
-    _ = try self.ring.socket_direct_alloc(idx, domain, socket_type, 0, 0);
+    try self.ensureSubmissionQueueCapacity(1);
+    _ = self.ring.socket_direct_alloc(idx, domain, socket_type, 0, 0) catch |err| switch (err) {
+        error.SubmissionQueueFull => unreachable,
+    };
 
     op.* = .{
-        .context = context,
-        .onComplete = struct {
-            const Context = @TypeOf(context);
-            fn complete(op_: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
-                const ctx: Context = @alignCast(@ptrCast(op_.context orelse return));
+        .ptr = context,
+        .callback = struct {
+            fn callback(op_: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
+                const ctx: @TypeOf(context) = @alignCast(@ptrCast(op_.ptr orelse return));
                 switch (cqe.err()) {
                     .SUCCESS => try onComplete(ctx, @intCast(cqe.res)),
                     else => |errno| try onComplete(ctx, errFromErrno(errno)),
                 }
             }
-        }.complete,
+        }.callback,
     };
     return idx;
 }
@@ -227,37 +243,36 @@ pub fn listen(
     opt: std.net.Address.ListenOptions,
     context: anytype,
     comptime onComplete: fn (@TypeOf(context), anyerror!void) anyerror!void,
-) !usize {
-    try self.ensureUnusedSqes(if (opt.reuse_address) 4 else 2);
+) SubmitError!usize {
     const op, const idx = try self.getOp();
+    try self.ensureSubmissionQueueCapacity(if (opt.reuse_address) 4 else 2);
     var sqe: *linux.io_uring_sqe = undefined;
 
     // Hardlink ensures that the last operation will get meaningful error. With
     // (soft)link in the case of error in bind onComplete will always get
     // error.OperationCanceled.
     if (opt.reuse_address) {
-        sqe = try self.ring.setsockopt(no_user_data, fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, yes_socket_option);
+        sqe = self.ring.setsockopt(no_user_data, fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, yes_socket_option) catch unreachable;
         sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
-        sqe = try self.ring.setsockopt(no_user_data, fd, linux.SOL.SOCKET, linux.SO.REUSEPORT, yes_socket_option);
+        sqe = self.ring.setsockopt(no_user_data, fd, linux.SOL.SOCKET, linux.SO.REUSEPORT, yes_socket_option) catch unreachable;
         sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
     }
-    sqe = try self.ring.bind(no_user_data, fd, &addr.any, addr.getOsSockLen(), 0);
+    sqe = self.ring.bind(no_user_data, fd, &addr.any, addr.getOsSockLen(), 0) catch unreachable;
     sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
-    sqe = try self.ring.listen(idx, fd, opt.kernel_backlog, 0);
+    sqe = self.ring.listen(idx, fd, opt.kernel_backlog, 0) catch unreachable;
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 
     op.* = .{
-        .context = context,
-        .onComplete = struct {
-            const Context = @TypeOf(context);
-            fn complete(op_: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
-                const ctx: Context = @alignCast(@ptrCast(op_.context orelse return));
+        .ptr = context,
+        .callback = struct {
+            fn callback(op_: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
+                const ctx: @TypeOf(context) = @alignCast(@ptrCast(op_.ptr orelse return));
                 switch (cqe.err()) {
                     .SUCCESS => try onComplete(ctx, {}),
                     else => |errno| try onComplete(ctx, errFromErrno(errno)),
                 }
             }
-        }.complete,
+        }.callback,
     };
     return idx;
 }
@@ -269,30 +284,29 @@ pub fn connect(
     timeout: ?*linux.kernel_timespec,
     context: anytype,
     comptime onComplete: fn (@TypeOf(context), anyerror!void) anyerror!void,
-) !usize {
-    try self.ensureUnusedSqes(2);
+) SubmitError!usize {
     const op, const idx = try self.getOp();
+    try self.ensureSubmissionQueueCapacity(2);
 
-    var sqe = try self.ring.connect(idx, fd, &addr.any, addr.getOsSockLen());
+    var sqe = self.ring.connect(idx, fd, &addr.any, addr.getOsSockLen()) catch unreachable;
     sqe.flags |= linux.IOSQE_FIXED_FILE;
     if (timeout) |t| {
         sqe.flags |= linux.IOSQE_IO_LINK;
-        sqe = try self.ring.link_timeout(no_user_data, t, 0);
+        sqe = self.ring.link_timeout(no_user_data, t, 0) catch unreachable;
         sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
     }
 
     op.* = .{
-        .context = context,
-        .onComplete = struct {
-            const Context = @TypeOf(context);
-            fn complete(op_: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
-                const ctx: Context = @alignCast(@ptrCast(op_.context orelse return));
+        .ptr = context,
+        .callback = struct {
+            fn callback(op_: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
+                const ctx: @TypeOf(context) = @alignCast(@ptrCast(op_.ptr orelse return));
                 switch (cqe.err()) {
                     .SUCCESS => try onComplete(ctx, {}),
                     else => |errno| try onComplete(ctx, errFromErrno(errno)),
                 }
             }
-        }.complete,
+        }.callback,
     };
     return idx;
 }
@@ -302,25 +316,24 @@ pub fn accept(
     fd: linux.fd_t,
     context: anytype,
     comptime onComplete: fn (@TypeOf(context), anyerror!linux.fd_t) anyerror!void,
-) !usize {
-    try self.ensureUnusedSqes(1);
+) SubmitError!usize {
     const op, const idx = try self.getOp();
+    try self.ensureSubmissionQueueCapacity(1);
 
-    var sqe = try self.ring.accept_direct(idx, fd, null, null, 0);
+    var sqe = self.ring.accept_direct(idx, fd, null, null, 0) catch unreachable;
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 
     op.* = .{
-        .context = context,
-        .onComplete = struct {
-            const Context = @TypeOf(context);
-            fn complete(op_: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
-                const ctx: Context = @alignCast(@ptrCast(op_.context orelse return));
+        .ptr = context,
+        .callback = struct {
+            fn callback(op_: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
+                const ctx: @TypeOf(context) = @alignCast(@ptrCast(op_.ptr orelse return));
                 switch (cqe.err()) {
                     .SUCCESS => try onComplete(ctx, @intCast(cqe.res)),
                     else => |errno| try onComplete(ctx, errFromErrno(errno)),
                 }
             }
-        }.complete,
+        }.callback,
     };
     return idx;
 }
@@ -331,25 +344,24 @@ pub fn recv(
     buffer: []u8,
     context: anytype,
     comptime onComplete: fn (@TypeOf(context), anyerror!u32) anyerror!void,
-) !usize {
-    try self.ensureUnusedSqes(1);
+) SubmitError!usize {
     const op, const idx = try self.getOp();
+    try self.ensureSubmissionQueueCapacity(1);
 
-    var sqe = try self.ring.recv(idx, fd, .{ .buffer = buffer }, 0);
+    var sqe = self.ring.recv(idx, fd, .{ .buffer = buffer }, 0) catch unreachable;
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 
     op.* = .{
-        .context = context,
-        .onComplete = struct {
-            const Context = @TypeOf(context);
-            fn complete(op_: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
-                const ctx: Context = @alignCast(@ptrCast(op_.context orelse return));
+        .ptr = context,
+        .callback = struct {
+            fn callback(op_: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
+                const ctx: @TypeOf(context) = @alignCast(@ptrCast(op_.ptr orelse return));
                 switch (cqe.err()) {
                     .SUCCESS => try onComplete(ctx, @intCast(cqe.res)),
                     else => |errno| try onComplete(ctx, errFromErrno(errno)),
                 }
             }
-        }.complete,
+        }.callback,
     };
     return idx;
 }
@@ -360,50 +372,49 @@ pub fn send(
     buffer: []const u8,
     context: anytype,
     comptime onComplete: fn (@TypeOf(context), anyerror!u32) anyerror!void,
-) !usize {
-    try self.ensureUnusedSqes(1);
+) SubmitError!usize {
     const op, const idx = try self.getOp();
+    try self.ensureSubmissionQueueCapacity(1);
 
-    var sqe = try self.ring.send(idx, fd, buffer, linux.MSG.WAITALL | linux.MSG.NOSIGNAL);
+    var sqe = self.ring.send(idx, fd, buffer, linux.MSG.WAITALL | linux.MSG.NOSIGNAL) catch unreachable;
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 
     op.* = .{
-        .context = context,
-        .onComplete = struct {
-            const Context = @TypeOf(context);
-            fn complete(op_: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
-                const ctx: Context = @alignCast(@ptrCast(op_.context orelse return));
+        .ptr = context,
+        .callback = struct {
+            fn callback(op_: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
+                const ctx: @TypeOf(context) = @alignCast(@ptrCast(op_.ptr orelse return));
                 switch (cqe.err()) {
                     .SUCCESS => try onComplete(ctx, @intCast(cqe.res)),
                     else => |errno| try onComplete(ctx, errFromErrno(errno)),
                 }
             }
-        }.complete,
+        }.callback,
     };
     return idx;
 }
 
-pub fn close(self: *Loop, fd: linux.fd_t) !void {
-    try self.ensureUnusedSqes(1);
-    var sqe = try self.ring.close_direct(no_user_data, @intCast(fd));
+pub fn close(self: *Loop, fd: linux.fd_t) RingSubmitError!void {
+    try self.ensureSubmissionQueueCapacity(1);
+    var sqe = self.ring.close_direct(no_user_data, @intCast(fd)) catch unreachable;
     sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
 }
 
-pub fn cancel(self: *Loop, idx: usize) !void {
-    try self.ensureUnusedSqes(1);
-    var sqe = try self.ring.cancel(no_user_data, idx, 0);
+pub fn cancel(self: *Loop, idx: usize) RingSubmitError!void {
+    try self.ensureSubmissionQueueCapacity(1);
+    var sqe = self.ring.cancel(no_user_data, idx, 0) catch unreachable;
     sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
 }
 
 pub fn detach(self: *Loop, op_idx: usize, ctx: *anyopaque) void {
     const op = &self.op_list.items[op_idx];
-    if (op.context) |op_ctx| if (op_ctx == ctx) {
+    if (op.ptr) |op_ctx| if (op_ctx == ctx) {
         op.detach(ctx);
     };
 }
 
-pub fn cancelOps(self: *Loop, ctx: *anyopaque) !void {
-    for (self.op_list.items, 0..) |*op, idx| if (op.context) |op_ctx| if (op_ctx == ctx) {
+pub fn cancelOps(self: *Loop, ctx: *anyopaque) RingSubmitError!void {
+    for (self.op_list.items, 0..) |*op, idx| if (op.ptr) |op_ctx| if (op_ctx == ctx) {
         op.detach(ctx);
         try self.cancel(idx);
     };
