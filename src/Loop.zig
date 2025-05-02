@@ -48,6 +48,7 @@ metric: struct {
 } = .{},
 tick_timer_ts: linux.kernel_timespec = .{ .sec = 0, .nsec = 0 },
 tick_timer: usize = 0,
+next_buffer_group_id: u16 = 0,
 
 //TODO: add all tcp structs or remove
 tcp: Tcp = .{},
@@ -332,6 +333,33 @@ pub fn connect(
     return idx;
 }
 
+pub const ConnectErrorAction = enum {
+    retry,
+    fail,
+};
+
+pub fn connectErrorAction(err: anyerror) ConnectErrorAction {
+    // ref: https://man7.org/linux/man-pages/man2/connect.2.html
+    return switch (err) {
+        error.ConnectionRefused, // ECONNREFUSED
+        error.NetworkIsUnreachable, // ENETUNREACH
+        error.HostUnreachable, // EHOSTUNREACH
+        error.ConnectionTimedOut, // ETIMEDOUT
+        error.ConnectionResetByPeer, // ECONNRESET
+
+        error.AddressAlreadyInUse, // EADDRINUSE
+        error.OperationAlreadyInProgress, // EALREADY
+        error.OperationNowInProgress, // EINPROGRESS
+        error.TryAgain, // EAGAIN
+        error.TransportEndpointIsAlreadyConnected, //  EISCONN
+
+        error.InterruptedSystemCall, // EINTR
+        => .retry,
+        error.OperationCanceled => .fail,
+        else => .fail,
+    };
+}
+
 pub fn accept(
     self: *Loop,
     fd: linux.fd_t,
@@ -447,6 +475,23 @@ pub fn detach(self: *Loop, ctx: *anyopaque) RingSubmitError!void {
 fn tickTimer(self: *Loop, ts: *linux.kernel_timespec) RingSubmitError!void {
     try self.ensureSubmissionQueueCapacity(1);
     _ = self.ring.timeout(timer_user_data, ts, 0, 0) catch unreachable;
+}
+
+pub fn initBufferGroup(
+    self: *Loop,
+    allocator: std.mem.Allocator,
+    buffer_size: u32,
+    buffers_count: u16,
+) !linux.IoUring.BufferGroup {
+    const bg = try linux.IoUring.BufferGroup.init(
+        &self.ring,
+        allocator,
+        self.next_buffer_group_id,
+        buffer_size,
+        buffers_count,
+    );
+    self.next_buffer_group_id += 1;
+    return bg;
 }
 
 test "socket" {

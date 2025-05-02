@@ -1,4 +1,8 @@
+const std = @import("std");
+const linux = std.os.linux;
+
 pub const Loop = @import("Loop.zig");
+pub const BufferGroup = linux.IoUring.BufferGroup;
 
 pub const tcp = struct {
     pub const Listener = @import("tcp.zig").Listener;
