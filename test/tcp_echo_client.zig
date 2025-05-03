@@ -17,10 +17,11 @@ pub fn main() !void {
     defer _ = debug_allocator.deinit();
     const gpa = debug_allocator.allocator();
 
+    var ops: [64]io.Loop.Op = undefined;
     var loop = try io.Loop.init(.{
         .entries = 256,
-        .fd_nr = 128,
-        .op_list = io.Loop.OpList.init(gpa),
+        .fd_nr = 32,
+        .op_list = &ops,
     });
     defer loop.deinit();
 

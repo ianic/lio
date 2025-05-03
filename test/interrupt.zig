@@ -13,16 +13,17 @@ const log = std.log.scoped(.main);
 // Signal:
 // $ pkill -12 interrupt
 pub fn main() !void {
-    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = debug_allocator.deinit();
-    const gpa = debug_allocator.allocator();
+    // var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
+    // defer _ = debug_allocator.deinit();
+    // const gpa = debug_allocator.allocator();
 
     setSignalHandler();
 
+    var ops: [4]io.Loop.Op = undefined;
     var loop = try io.Loop.init(.{
         .entries = 16,
         .fd_nr = 2,
-        .op_list = io.Loop.OpList.init(gpa),
+        .op_list = &ops,
         .flags = linux.IORING_SETUP_SINGLE_ISSUER, //| linux.IORING_SETUP_SQPOLL,
     });
     defer loop.deinit();

@@ -15,7 +15,7 @@ pub const Options = struct {
     fd_nr: u16,
     /// Provided pool operations pool.
     /// Operation is submitted but not jet completed task; in kernel task.
-    op_list: OpList,
+    op_list: []Op,
 };
 
 pub const Op = struct {
@@ -41,8 +41,8 @@ const no_user_data: u64 = std.math.maxInt(u64);
 const timer_user_data: u64 = no_user_data - 1;
 
 ring: linux.IoUring,
-op_list: OpList = undefined,
-op_idx: usize = std.math.maxInt(usize),
+op_list: []Op,
+next_op_idx: usize = 0,
 metric: struct {
     active_op: usize = 0,
 } = .{},
@@ -70,11 +70,14 @@ pub fn init(opt: Options) !Loop {
     var ring = try linux.IoUring.init(opt.entries, opt.flags);
     errdefer ring.deinit();
     try ring.register_files_sparse(opt.fd_nr);
-    return .{ .ring = ring, .op_list = opt.op_list };
+    for (opt.op_list) |*op| op.* = .{};
+    return .{
+        .ring = ring,
+        .op_list = opt.op_list,
+    };
 }
 
 pub fn deinit(self: *Loop) void {
-    self.op_list.deinit();
     self.ring.deinit();
 }
 
@@ -117,15 +120,13 @@ fn processReadyCompletions(self: *Loop) !bool {
             completed += 1;
             continue;
         }
-        var op: *Op = &self.op_list.items[cqe.user_data];
+        var op: *Op = &self.op_list[cqe.user_data];
         //std.debug.print("op: {} cqe: {}\n", .{ op, cqe });
         try op.callback(op, self, cqe);
         // Only advance if not error, will try next time same cqe in the
         // case of error.
         completed += 1;
         if (!flagMore(cqe)) {
-            // TODO: list is moved
-            op = &self.op_list.items[cqe.user_data];
             // Done with operation mark it as unused
             op.ptr = null;
             self.metric.active_op -= 1;
@@ -178,7 +179,7 @@ pub const RingSubmitError = error{
     Unexpected,
 };
 
-pub const SubmitError = RingSubmitError || error{OutOfMemory};
+pub const SubmitError = RingSubmitError || error{OperationListFull};
 
 fn ensureSubmissionQueueCapacity(self: *Loop, count: u32) RingSubmitError!void {
     assert(count <= self.ring.sq.sqes.len);
@@ -200,33 +201,27 @@ fn ensureSubmissionQueueCapacity(self: *Loop, count: u32) RingSubmitError!void {
 }
 
 /// Returns Op and index to that Op in op_list.items
-fn getOp(self: *Loop) error{OutOfMemory}!struct { *Op, usize } {
-    const op_count = self.op_list.items.len;
-    if (self.metric.active_op < op_count) {
-        // find unused op with higher index than ths last one
-        for (self.op_idx + 1..op_count) |idx| {
-            const op = &self.op_list.items[idx];
-            if (op.ptr == null) {
-                self.metric.active_op += 1;
-                self.op_idx = idx;
-                return .{ op, idx };
-            }
-        }
-        // find unused from start of the list
-        for (0..@min(self.op_idx + 1, op_count)) |idx| {
-            const op = &self.op_list.items[idx];
-            if (op.ptr == null) {
-                self.metric.active_op += 1;
-                self.op_idx = idx;
-                return .{ op, idx };
-            }
+fn getOp(self: *Loop) error{OperationListFull}!struct { *Op, usize } {
+    const len = self.op_list.len;
+    // find unused op with higher index than the last one
+    for (self.next_op_idx..len) |idx| {
+        const op = &self.op_list[idx];
+        if (op.ptr == null) {
+            self.metric.active_op += 1;
+            self.next_op_idx = idx + 1;
+            return .{ op, idx };
         }
     }
-    try self.op_list.append(.{});
-    const idx = self.op_list.items.len - 1;
-    self.metric.active_op += 1;
-    self.op_idx = idx;
-    return .{ &self.op_list.items[idx], idx };
+    // find unused from start of the list
+    for (0..@min(self.next_op_idx, len)) |idx| {
+        const op = &self.op_list[idx];
+        if (op.ptr == null) {
+            self.metric.active_op += 1;
+            self.next_op_idx = idx + 1;
+            return .{ op, idx };
+        }
+    }
+    return error.OperationListFull;
 }
 
 pub fn socket(
@@ -457,16 +452,18 @@ pub fn cancel(self: *Loop, idx: usize) RingSubmitError!void {
 }
 
 /// Detach single operation by index.
-pub fn detachOp(self: *Loop, op_idx: usize, ctx: *anyopaque) void {
-    const op = &self.op_list.items[op_idx];
+pub fn detachOp(self: *Loop, idx: usize, ctx: *anyopaque) !void {
+    if (idx >= self.op_list.len) return;
+    const op = &self.op_list[idx];
     if (op.ptr) |op_ptr| if (op_ptr == ctx) {
         op.detach(ctx);
+        try self.cancel(idx);
     };
 }
 
 /// Detach all operations for some context and cancel any pending operations.
 pub fn detach(self: *Loop, ctx: *anyopaque) RingSubmitError!void {
-    for (self.op_list.items, 0..) |*op, idx| if (op.ptr) |op_ptr| if (op_ptr == ctx) {
+    for (self.op_list, 0..) |*op, idx| if (op.ptr) |op_ptr| if (op_ptr == ctx) {
         op.detach(ctx);
         try self.cancel(idx);
     };
@@ -495,10 +492,11 @@ pub fn initBufferGroup(
 }
 
 test "socket" {
+    var ops: [1]Op = undefined;
     var loop = try Loop.init(.{
         .entries = 1,
         .fd_nr = 2,
-        .op_list = OpList.init(testing.allocator),
+        .op_list = &ops,
     });
     defer loop.deinit();
 
@@ -558,10 +556,11 @@ test "socket" {
 }
 
 test "error in callback, should not advance cq ring" {
+    var ops: [1]Op = undefined;
     var loop = try Loop.init(.{
         .entries = 1,
         .fd_nr = 2,
-        .op_list = OpList.init(testing.allocator),
+        .op_list = &ops,
     });
     defer loop.deinit();
 
@@ -588,7 +587,7 @@ test "error in callback, should not advance cq ring" {
         try testing.expectError(error.OnSocketTestError, loop.tickNr(1));
         try testing.expectEqual(1, loop.ring.cq_ready());
         try testing.expectEqual(1, ctx.call_count);
-        loop.detachOp(op, &ctx);
+        try loop.detachOp(op, &ctx);
     }
     { // retrying cqe, now succeeds
         try testing.expectEqual(1, loop.ring.cq_ready());
@@ -601,10 +600,11 @@ test "error in callback, should not advance cq ring" {
 }
 
 test "ensure unused sqes pushes sqes to the kernel" {
+    var ops: [3]Op = undefined;
     var loop = try Loop.init(.{
         .entries = 2,
         .fd_nr = 2,
-        .op_list = OpList.init(testing.allocator),
+        .op_list = &ops,
     });
     defer loop.deinit();
 
@@ -631,13 +631,11 @@ test "ensure unused sqes pushes sqes to the kernel" {
 }
 
 test "OutOfMemory on operations list unable to grow" {
-    var fba_buf: [@sizeOf(Op) * 10]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
-
+    var ops: [16]Op = undefined;
     var loop = try Loop.init(.{
         .entries = 2,
         .fd_nr = 2,
-        .op_list = OpList.init(fba.allocator()),
+        .op_list = &ops,
     });
     defer loop.deinit();
 
@@ -657,20 +655,22 @@ test "OutOfMemory on operations list unable to grow" {
     const domain = linux.AF.INET;
     const socket_type = linux.SOCK.STREAM;
 
-    for (0..1024) |_| {
-        _ = loop.socket(domain, socket_type, &ctx, Ctx.onSocket) catch |err| switch (err) {
-            error.OutOfMemory => return,
-            else => unreachable,
-        };
+    for (0..16) |_| {
+        _ = try loop.socket(domain, socket_type, &ctx, Ctx.onSocket);
     }
+    _ = loop.socket(domain, socket_type, &ctx, Ctx.onSocket) catch |err| switch (err) {
+        error.OperationListFull => return,
+        else => unreachable,
+    };
     unreachable;
 }
 
 test "listen (linked request) should return meaningful error" {
+    var ops: [1]Op = undefined;
     var loop = try Loop.init(.{
         .entries = 4,
         .fd_nr = 2,
-        .op_list = OpList.init(testing.allocator),
+        .op_list = &ops,
     });
     defer loop.deinit();
 
@@ -696,10 +696,11 @@ test "listen (linked request) should return meaningful error" {
 test "tcp server" {
     // echo -n one | nc -w0 localhost 9898 && echo -n two | nc -w0 localhost 9898 && echo -n three | nc -w0 localhost 9898 && echo -n four | nc -w0 localhost 9898
 
+    var ops: [2]Op = undefined;
     var loop = try Loop.init(.{
         .entries = 16,
         .fd_nr = 2,
-        .op_list = OpList.init(testing.allocator),
+        .op_list = &ops,
     });
     defer loop.deinit();
 

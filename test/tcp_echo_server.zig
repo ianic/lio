@@ -19,10 +19,11 @@ pub fn main() !void {
     defer _ = debug_allocator.deinit();
     const gpa = debug_allocator.allocator();
 
+    var ops: [2048]io.Loop.Op = undefined;
     var loop = try io.Loop.init(.{
         .entries = 4096,
         .fd_nr = 1024,
-        .op_list = io.Loop.OpList.init(gpa),
+        .op_list = &ops,
     });
     defer loop.deinit();
 
@@ -71,11 +72,12 @@ const Connection = struct {
     buffer: [1024 * 64]u8 = undefined,
     head: u32 = 0,
     tail: u32 = 0,
+    ops: [2]usize = undefined,
 
     fn recv(self: *Self) !void {
         self.head = 0;
         self.tail = 0;
-        _ = try self.loop.recv(self.fd, &self.buffer, self, onRecv);
+        self.ops[0] = try self.loop.recv(self.fd, &self.buffer, self, onRecv);
     }
 
     fn onRecv(self: *Self, n_err: anyerror!u32) anyerror!void {
@@ -97,7 +99,7 @@ const Connection = struct {
     }
 
     fn send(self: *Self) !void {
-        _ = try self.loop.send(self.fd, self.buffer[self.head..self.tail], self, onSend);
+        self.ops[1] = try self.loop.send(self.fd, self.buffer[self.head..self.tail], self, onSend);
     }
 
     fn onSend(self: *Self, n_err: anyerror!u32) anyerror!void {
@@ -121,7 +123,9 @@ const Connection = struct {
 
     fn close(self: *Self) !void {
         try self.loop.close(self.fd);
-        try self.loop.detach(self);
+        // log.debug("close {d}", .{self.ops});
+        for (self.ops) |op| try self.loop.detachOp(op, self);
+        // try self.loop.detach(self);
         self.allocator.destroy(self);
     }
 };
