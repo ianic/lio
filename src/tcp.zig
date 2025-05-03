@@ -11,8 +11,9 @@ pub const Connector = struct {
     addr: std.net.Address,
     context: *anyopaque,
     callback: *const fn (*Self, anyerror!linux.fd_t) anyerror!void,
-    fd: ?linux.fd_t = null, // connected socket
+    fd: linux.fd_t = -1,
     connect_timeout: linux.kernel_timespec = .{ .sec = 10, .nsec = 0 },
+    op: usize = 0,
 
     pub fn init(
         self: *Self,
@@ -37,17 +38,14 @@ pub const Connector = struct {
     }
 
     pub fn connect(self: *Self) !void {
-        if (self.fd) |fd| {
-            _ = try self.loop.connect(fd, &self.addr, &self.connect_timeout, self, onConnect);
-        } else {
-            _ = try self.loop.socket(self.addr.any.family, linux.SOCK.STREAM, self, onSocket);
-        }
+        if (self.fd > 0) try self.close();
+        self.op = try self.loop.socket(self.addr.any.family, linux.SOCK.STREAM, self, onSocket);
     }
 
     fn onSocket(self: *Self, fd_err: anyerror!linux.fd_t) anyerror!void {
         if (fd_err) |fd| {
             self.fd = fd;
-            _ = self.loop.connect(fd, &self.addr, &self.connect_timeout, self, onConnect) catch |err| {
+            self.op = self.loop.connect(fd, &self.addr, &self.connect_timeout, self, onConnect) catch |err| {
                 return try self.callback(self, err);
             };
         } else |err| {
@@ -56,23 +54,20 @@ pub const Connector = struct {
     }
 
     fn onConnect(self: *Self, _err: anyerror!void) anyerror!void {
-        const fd = self.fd.?;
-        errdefer self.loop.close(fd) catch {};
+        errdefer self.loop.close(self.fd) catch {};
         if (_err) |_| {
-            // Transfer fd ownership to the callback.
-            self.fd = null;
-            try self.callback(self, fd);
+            try self.callback(self, self.fd);
         } else |err| {
             try self.callback(self, err);
         }
     }
 
     pub fn close(self: *Self) !void {
-        if (self.fd) |fd| {
-            _ = try self.loop.close(fd);
-            self.fd = null;
+        if (self.fd > 0) {
+            _ = try self.loop.close(self.fd);
+            self.fd = -1;
         }
-        try self.loop.cancelOps(self);
+        try self.loop.detachOp(self.op, self);
     }
 };
 

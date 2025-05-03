@@ -48,7 +48,7 @@ const Connection = struct {
     no: usize,
     connector: io.tcp.Connector = undefined,
 
-    fd: linux.fd_t = 0,
+    fd: linux.fd_t = -1,
     buffer: [64 * 1024]u8 = undefined,
     send_head: u32 = 0,
     send_tail: u32 = 0,

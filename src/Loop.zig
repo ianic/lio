@@ -439,6 +439,7 @@ pub fn send(
 }
 
 pub fn close(self: *Loop, fd: linux.fd_t) RingSubmitError!void {
+    if (fd < 0) return;
     try self.ensureSubmissionQueueCapacity(1);
     var sqe = self.ring.close_direct(no_user_data, @intCast(fd)) catch unreachable;
     sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
