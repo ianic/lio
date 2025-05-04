@@ -3,8 +3,14 @@ const assert = std.debug.assert;
 const linux = std.os.linux;
 const testing = std.testing;
 
-const errFromErrno = @import("errno.zig").toError;
-pub const OpList = std.ArrayList(Op);
+const SyscallError = @import("errno.zig").Error;
+
+fn success(cqe: linux.io_uring_cqe) SyscallError!void {
+    switch (cqe.err()) {
+        .SUCCESS => return,
+        else => |errno| return @import("errno.zig").toError(errno),
+    }
+}
 
 pub const Options = struct {
     /// Number of submission queue entries
@@ -163,11 +169,11 @@ fn flagMore(cqe: linux.io_uring_cqe) bool {
 
 /// Number of unused submission queue entries
 /// Matched liburing io_uring_sq_space_left
-pub fn sqSpaceLeft(self: *Loop) u32 {
+pub fn submissionQueueSpaceLeft(self: *Loop) u32 {
     return @as(u32, @intCast(self.ring.sq.sqes.len)) - self.ring.sq_ready();
 }
 
-pub const RingSubmitError = error{
+pub const SubmitError = error{
     SystemResources,
     FileDescriptorInvalid,
     FileDescriptorInBadState,
@@ -179,11 +185,11 @@ pub const RingSubmitError = error{
     Unexpected,
 };
 
-pub const SubmitError = RingSubmitError || error{OperationListFull};
+pub const PrepareError = SubmitError || error{NoOperationsAvailable};
 
-fn ensureSubmissionQueueCapacity(self: *Loop, count: u32) RingSubmitError!void {
+fn ensureSubmissionQueueCapacity(self: *Loop, count: u32) SubmitError!void {
     assert(count <= self.ring.sq.sqes.len);
-    while (self.sqSpaceLeft() < count) {
+    while (self.submissionQueueSpaceLeft() < count) {
         _ = self.ring.submit() catch |err| switch (err) {
             error.SignalInterrupt => continue,
 
@@ -200,8 +206,8 @@ fn ensureSubmissionQueueCapacity(self: *Loop, count: u32) RingSubmitError!void {
     }
 }
 
-/// Returns Op and index to that Op in op_list.items
-fn getOp(self: *Loop) error{OperationListFull}!struct { *Op, usize } {
+/// Returns Op and index to that Op in op_list
+fn getOp(self: *Loop) error{NoOperationsAvailable}!struct { *Op, usize } {
     const len = self.op_list.len;
     // find unused op with higher index than the last one
     for (self.next_op_idx..len) |idx| {
@@ -221,7 +227,20 @@ fn getOp(self: *Loop) error{OperationListFull}!struct { *Op, usize } {
             return .{ op, idx };
         }
     }
-    return error.OperationListFull;
+    return error.NoOperationsAvailable;
+}
+
+fn prepareOp(
+    self: *Loop,
+    ptr: *anyopaque,
+    callback: *const fn (*Op, *Loop, linux.io_uring_cqe) anyerror!void,
+) error{NoOperationsAvailable}!usize {
+    const op, const idx = try self.getOp();
+    op.* = .{
+        .ptr = ptr,
+        .callback = callback,
+    };
+    return idx;
 }
 
 pub fn socket(
@@ -230,26 +249,23 @@ pub fn socket(
     socket_type: u32,
     context: anytype,
     comptime onComplete: fn (@TypeOf(context), anyerror!linux.fd_t) anyerror!void,
-) SubmitError!usize {
-    const op, const idx = try self.getOp();
+) PrepareError!usize {
+    const wrap = struct {
+        fn callback(op: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
+            try onComplete(
+                @alignCast(@ptrCast(op.ptr orelse return)),
+                if (success(cqe)) @intCast(cqe.res) else |err| err,
+            );
+        }
+    };
+    const op_idx = try self.prepareOp(context, wrap.callback);
+
     try self.ensureSubmissionQueueCapacity(1);
-    _ = self.ring.socket_direct_alloc(idx, domain, socket_type, 0, 0) catch |err| switch (err) {
+    _ = self.ring.socket_direct_alloc(op_idx, domain, socket_type, 0, 0) catch |err| switch (err) {
         error.SubmissionQueueFull => unreachable,
     };
 
-    op.* = .{
-        .ptr = context,
-        .callback = struct {
-            fn callback(op_: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
-                const ctx: @TypeOf(context) = @alignCast(@ptrCast(op_.ptr orelse return));
-                switch (cqe.err()) {
-                    .SUCCESS => try onComplete(ctx, @intCast(cqe.res)),
-                    else => |errno| try onComplete(ctx, errFromErrno(errno)),
-                }
-            }
-        }.callback,
-    };
-    return idx;
+    return op_idx;
 }
 
 pub fn listen(
@@ -260,11 +276,19 @@ pub fn listen(
     opt: std.net.Address.ListenOptions,
     context: anytype,
     comptime onComplete: fn (@TypeOf(context), anyerror!void) anyerror!void,
-) SubmitError!usize {
-    const op, const idx = try self.getOp();
+) PrepareError!usize {
+    const wrap = struct {
+        fn callback(op: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
+            try onComplete(
+                @alignCast(@ptrCast(op.ptr orelse return)),
+                if (success(cqe)) {} else |err| err,
+            );
+        }
+    };
+    const op_idx = try self.prepareOp(context, wrap.callback);
+
     try self.ensureSubmissionQueueCapacity(if (opt.reuse_address) 4 else 2);
     var sqe: *linux.io_uring_sqe = undefined;
-
     // Hardlink ensures that the last operation will get meaningful error. With
     // (soft)link in the case of error in bind onComplete will always get
     // error.OperationCanceled.
@@ -276,22 +300,10 @@ pub fn listen(
     }
     sqe = self.ring.bind(no_user_data, fd, &addr.any, addr.getOsSockLen(), 0) catch unreachable;
     sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
-    sqe = self.ring.listen(idx, fd, opt.kernel_backlog, 0) catch unreachable;
+    sqe = self.ring.listen(op_idx, fd, opt.kernel_backlog, 0) catch unreachable;
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 
-    op.* = .{
-        .ptr = context,
-        .callback = struct {
-            fn callback(op_: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
-                const ctx: @TypeOf(context) = @alignCast(@ptrCast(op_.ptr orelse return));
-                switch (cqe.err()) {
-                    .SUCCESS => try onComplete(ctx, {}),
-                    else => |errno| try onComplete(ctx, errFromErrno(errno)),
-                }
-            }
-        }.callback,
-    };
-    return idx;
+    return op_idx;
 }
 
 pub fn connect(
@@ -300,12 +312,20 @@ pub fn connect(
     addr: *std.net.Address,
     timeout: ?*linux.kernel_timespec,
     context: anytype,
-    comptime onComplete: fn (@TypeOf(context), anyerror!void) anyerror!void,
-) SubmitError!usize {
-    const op, const idx = try self.getOp();
-    try self.ensureSubmissionQueueCapacity(2);
+    comptime onComplete: fn (@TypeOf(context), SyscallError!void) anyerror!void,
+) PrepareError!usize {
+    const wrap = struct {
+        fn callback(op: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
+            try onComplete(
+                @alignCast(@ptrCast(op.ptr orelse return)),
+                if (success(cqe)) {} else |err| err,
+            );
+        }
+    };
+    const op_idx = try self.prepareOp(context, wrap.callback);
 
-    var sqe = self.ring.connect(idx, fd, &addr.any, addr.getOsSockLen()) catch unreachable;
+    try self.ensureSubmissionQueueCapacity(2);
+    var sqe = self.ring.connect(op_idx, fd, &addr.any, addr.getOsSockLen()) catch unreachable;
     sqe.flags |= linux.IOSQE_FIXED_FILE;
     if (timeout) |t| {
         sqe.flags |= linux.IOSQE_IO_LINK;
@@ -313,73 +333,30 @@ pub fn connect(
         sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
     }
 
-    op.* = .{
-        .ptr = context,
-        .callback = struct {
-            fn callback(op_: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
-                const ctx: @TypeOf(context) = @alignCast(@ptrCast(op_.ptr orelse return));
-                switch (cqe.err()) {
-                    .SUCCESS => try onComplete(ctx, {}),
-                    else => |errno| try onComplete(ctx, errFromErrno(errno)),
-                }
-            }
-        }.callback,
-    };
-    return idx;
-}
-
-pub const ConnectErrorAction = enum {
-    retry,
-    fail,
-};
-
-pub fn connectErrorAction(err: anyerror) ConnectErrorAction {
-    // ref: https://man7.org/linux/man-pages/man2/connect.2.html
-    return switch (err) {
-        error.ConnectionRefused, // ECONNREFUSED
-        error.NetworkIsUnreachable, // ENETUNREACH
-        error.HostUnreachable, // EHOSTUNREACH
-        error.ConnectionTimedOut, // ETIMEDOUT
-        error.ConnectionResetByPeer, // ECONNRESET
-
-        error.AddressAlreadyInUse, // EADDRINUSE
-        error.OperationAlreadyInProgress, // EALREADY
-        error.OperationNowInProgress, // EINPROGRESS
-        error.TryAgain, // EAGAIN
-        error.TransportEndpointIsAlreadyConnected, //  EISCONN
-
-        error.InterruptedSystemCall, // EINTR
-        => .retry,
-        error.OperationCanceled => .fail,
-        else => .fail,
-    };
+    return op_idx;
 }
 
 pub fn accept(
     self: *Loop,
     fd: linux.fd_t,
     context: anytype,
-    comptime onComplete: fn (@TypeOf(context), anyerror!linux.fd_t) anyerror!void,
-) SubmitError!usize {
-    const op, const idx = try self.getOp();
-    try self.ensureSubmissionQueueCapacity(1);
+    comptime onComplete: fn (@TypeOf(context), SyscallError!linux.fd_t) anyerror!void,
+) PrepareError!usize {
+    const wrap = struct {
+        fn callback(op: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
+            try onComplete(
+                @alignCast(@ptrCast(op.ptr orelse return)),
+                if (success(cqe)) @intCast(cqe.res) else |err| err,
+            );
+        }
+    };
+    const op_idx = try self.prepareOp(context, wrap.callback);
 
-    var sqe = self.ring.accept_direct(idx, fd, null, null, 0) catch unreachable;
+    try self.ensureSubmissionQueueCapacity(1);
+    var sqe = self.ring.accept_direct(op_idx, fd, null, null, 0) catch unreachable;
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 
-    op.* = .{
-        .ptr = context,
-        .callback = struct {
-            fn callback(op_: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
-                const ctx: @TypeOf(context) = @alignCast(@ptrCast(op_.ptr orelse return));
-                switch (cqe.err()) {
-                    .SUCCESS => try onComplete(ctx, @intCast(cqe.res)),
-                    else => |errno| try onComplete(ctx, errFromErrno(errno)),
-                }
-            }
-        }.callback,
-    };
-    return idx;
+    return op_idx;
 }
 
 pub fn recv(
@@ -387,27 +364,23 @@ pub fn recv(
     fd: linux.fd_t,
     buffer: []u8,
     context: anytype,
-    comptime onComplete: fn (@TypeOf(context), anyerror!u32) anyerror!void,
-) SubmitError!usize {
-    const op, const idx = try self.getOp();
-    try self.ensureSubmissionQueueCapacity(1);
+    comptime onComplete: fn (@TypeOf(context), SyscallError!u32) anyerror!void,
+) PrepareError!usize {
+    const wrap = struct {
+        fn callback(op: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
+            try onComplete(
+                @alignCast(@ptrCast(op.ptr orelse return)),
+                if (success(cqe)) @intCast(cqe.res) else |err| err,
+            );
+        }
+    };
+    const op_idx = try self.prepareOp(context, wrap.callback);
 
-    var sqe = self.ring.recv(idx, fd, .{ .buffer = buffer }, 0) catch unreachable;
+    try self.ensureSubmissionQueueCapacity(1);
+    var sqe = self.ring.recv(op_idx, fd, .{ .buffer = buffer }, 0) catch unreachable;
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 
-    op.* = .{
-        .ptr = context,
-        .callback = struct {
-            fn callback(op_: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
-                const ctx: @TypeOf(context) = @alignCast(@ptrCast(op_.ptr orelse return));
-                switch (cqe.err()) {
-                    .SUCCESS => try onComplete(ctx, @intCast(cqe.res)),
-                    else => |errno| try onComplete(ctx, errFromErrno(errno)),
-                }
-            }
-        }.callback,
-    };
-    return idx;
+    return op_idx;
 }
 
 pub fn send(
@@ -415,30 +388,26 @@ pub fn send(
     fd: linux.fd_t,
     buffer: []const u8,
     context: anytype,
-    comptime onComplete: fn (@TypeOf(context), anyerror!u32) anyerror!void,
-) SubmitError!usize {
-    const op, const idx = try self.getOp();
-    try self.ensureSubmissionQueueCapacity(1);
+    comptime onComplete: fn (@TypeOf(context), SyscallError!u32) anyerror!void,
+) PrepareError!usize {
+    const wrap = struct {
+        fn callback(op: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
+            try onComplete(
+                @alignCast(@ptrCast(op.ptr orelse return)),
+                if (success(cqe)) @intCast(cqe.res) else |err| err,
+            );
+        }
+    };
+    const op_idx = try self.prepareOp(context, wrap.callback);
 
-    var sqe = self.ring.send(idx, fd, buffer, linux.MSG.WAITALL | linux.MSG.NOSIGNAL) catch unreachable;
+    try self.ensureSubmissionQueueCapacity(1);
+    var sqe = self.ring.send(op_idx, fd, buffer, linux.MSG.WAITALL | linux.MSG.NOSIGNAL) catch unreachable;
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 
-    op.* = .{
-        .ptr = context,
-        .callback = struct {
-            fn callback(op_: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
-                const ctx: @TypeOf(context) = @alignCast(@ptrCast(op_.ptr orelse return));
-                switch (cqe.err()) {
-                    .SUCCESS => try onComplete(ctx, @intCast(cqe.res)),
-                    else => |errno| try onComplete(ctx, errFromErrno(errno)),
-                }
-            }
-        }.callback,
-    };
-    return idx;
+    return op_idx;
 }
 
-pub fn close(self: *Loop, fd: linux.fd_t) RingSubmitError!void {
+pub fn close(self: *Loop, fd: linux.fd_t) SubmitError!void {
     if (fd < 0) return;
     try self.ensureSubmissionQueueCapacity(1);
     var sqe = self.ring.close_direct(no_user_data, @intCast(fd)) catch unreachable;
@@ -446,7 +415,7 @@ pub fn close(self: *Loop, fd: linux.fd_t) RingSubmitError!void {
 }
 
 /// Cancel single operation by index.
-pub fn cancel(self: *Loop, idx: usize) RingSubmitError!void {
+pub fn cancel(self: *Loop, idx: usize) SubmitError!void {
     try self.ensureSubmissionQueueCapacity(1);
     var sqe = self.ring.cancel(no_user_data, idx, 0) catch unreachable;
     sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
@@ -463,14 +432,14 @@ pub fn detachOp(self: *Loop, idx: usize, ctx: *anyopaque) !void {
 }
 
 /// Detach all operations for some context and cancel any pending operations.
-pub fn detach(self: *Loop, ctx: *anyopaque) RingSubmitError!void {
+pub fn detach(self: *Loop, ctx: *anyopaque) SubmitError!void {
     for (self.op_list, 0..) |*op, idx| if (op.ptr) |op_ptr| if (op_ptr == ctx) {
         op.detach(ctx);
         try self.cancel(idx);
     };
 }
 
-fn tickTimer(self: *Loop, ts: *linux.kernel_timespec) RingSubmitError!void {
+fn tickTimer(self: *Loop, ts: *linux.kernel_timespec) SubmitError!void {
     try self.ensureSubmissionQueueCapacity(1);
     _ = self.ring.timeout(timer_user_data, ts, 0, 0) catch unreachable;
 }
@@ -660,7 +629,7 @@ test "OutOfMemory on operations list unable to grow" {
         _ = try loop.socket(domain, socket_type, &ctx, Ctx.onSocket);
     }
     _ = loop.socket(domain, socket_type, &ctx, Ctx.onSocket) catch |err| switch (err) {
-        error.OperationListFull => return,
+        error.NoOperationsAvailable => return,
         else => unreachable,
     };
     unreachable;

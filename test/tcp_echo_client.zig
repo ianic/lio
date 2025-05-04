@@ -31,22 +31,22 @@ pub fn main() !void {
 
     const addr: std.net.Address = try std.net.Address.resolveIp("127.0.0.1", 9900);
 
-    var conns: [24]Connection = undefined;
-    for (&conns, 0..) |*conn, no| {
-        try conn.init(&loop, addr, no);
+    var clients: [24]Client = undefined;
+    for (&clients, 0..) |*cli, no| {
+        try cli.init(&loop, addr, no);
     }
 
     while (true)
         try loop.tick();
 }
 
-const Connection = struct {
+const Client = struct {
     const Self = @This();
 
     loop: *io.Loop,
     addr: std.net.Address,
     no: usize,
-    connector: io.tcp.Connector = undefined,
+    connect_timeout: linux.kernel_timespec = .{ .sec = 10, .nsec = 0 },
 
     fd: linux.fd_t = -1,
     buffer: [64 * 1024]u8 = undefined,
@@ -60,50 +60,31 @@ const Connection = struct {
             .addr = addr,
             .no = no,
         };
-        try self.connector.init(self.loop, self.addr, self, onConnect);
+        try self.connect();
     }
 
-    fn onConnect(self: *Self, fd_err: anyerror!posix.fd_t) anyerror!void {
-        self.fd = fd_err catch |err| {
-            switch (err) {
-                error.ConnectionRefused,
-                error.ConnectionResetByPeer,
-                => {
-                    return try self.connector.connect();
-                },
-                else => {
-                    log.err("{} onConnect {}", .{ self.no, err });
-                    return err;
-                },
-            }
-        };
-        log.debug("{} connected", .{self.no});
-        try self.echo();
+    fn connect(self: *Self) !void {
+        assert(self.fd < 0);
+        _ = try self.loop.socket(self.addr.any.family, linux.SOCK.STREAM, self, onSocket);
     }
 
-    fn recv(self: *Self) !void {
-        _ = try self.loop.recv(self.fd, &self.buffer, self, onRecv);
+    fn onSocket(self: *Self, res: anyerror!linux.fd_t) anyerror!void {
+        if (res) |fd| {
+            self.fd = fd;
+            _ = try self.loop.connect(fd, &self.addr, &self.connect_timeout, self, onConnect);
+        } else |err| {
+            return err;
+        }
     }
 
-    fn onRecv(self: *Self, n_err: anyerror!u32) anyerror!void {
-        const n = n_err catch |err| {
-            log.debug("{} recv {}", .{ self.no, err });
-            switch (err) {
-                error.ConnectionResetByPeer => {},
-                error.OperationCanceled => {},
-                error.SocketOperationOnNonsocket => {},
-                else => log.err("{} recv {}", .{ self.no, err }),
-            }
-            return try self.reconnect();
-        };
-        if (n == 0) return try self.reconnect();
-
-        assert(std.mem.eql(u8, self.buffer[0..n], buffer[self.recv_pos..][0..n]));
-        self.recv_pos += n;
-        if (self.recv_pos == self.send_tail) {
+    fn onConnect(self: *Self, res: io.SyscallError!void) anyerror!void {
+        if (res) {
+            log.debug("{} connected", .{self.no});
             try self.echo();
-        } else {
-            try self.recv();
+        } else |err| switch (io.ConnectErrorKind.from(err)) {
+            .again, .interrupt => try self.reconnect(),
+            .cancel => unreachable,
+            .unexpected => return err,
         }
     }
 
@@ -121,31 +102,52 @@ const Connection = struct {
         _ = try self.loop.send(self.fd, buffer[self.send_head..self.send_tail], self, onSend);
     }
 
-    fn onSend(self: *Self, n_err: anyerror!u32) anyerror!void {
-        self.send_head += n_err catch |err| {
-            log.debug("{} send {}", .{ self.no, err });
-            switch (err) {
-                error.BrokenPipe, error.ConnectionResetByPeer => {},
-                error.OperationCanceled => {},
-                error.SocketOperationOnNonsocket => {},
-                else => log.err("{} send {}", .{ self.no, err }),
+    fn onSend(self: *Self, res: io.SyscallError!u32) anyerror!void {
+        if (res) |n| {
+            self.send_head += n;
+            if (self.send_head == self.send_tail) {
+                try self.recv();
+            } else {
+                // can't happen because we are sending with msg.waitall in Loop.send
+                log.err("{} short send", .{self.no});
+                try self.send();
             }
-            return try self.reconnect();
-        };
+        } else |err| switch (io.SendErrorKind.from(err)) {
+            .close => try self.reconnect(),
+            .interrupt => try self.send(),
+            .cancel => unreachable,
+            .unexpected => unreachable,
+        }
+    }
 
-        if (self.send_head == self.send_tail) {
-            try self.recv();
-        } else {
-            // can't happen because we are sending with msg.waitall in Loop.send
-            log.err("{} short send", .{self.no});
-            try self.send();
+    fn recv(self: *Self) !void {
+        _ = try self.loop.recv(self.fd, &self.buffer, self, onRecv);
+    }
+
+    fn onRecv(self: *Self, res: io.SyscallError!u32) anyerror!void {
+        if (res) |n| {
+            if (n == 0) return try self.reconnect();
+
+            assert(std.mem.eql(u8, self.buffer[0..n], buffer[self.recv_pos..][0..n]));
+            self.recv_pos += n;
+            if (self.recv_pos == self.send_tail) {
+                try self.echo();
+            } else {
+                try self.recv();
+            }
+        } else |err| switch (io.RecvErrorKind.from(err)) {
+            .close => try self.reconnect(),
+            .interrupt => try self.recv(),
+            .cancel => unreachable,
+            .unexpected => unreachable,
         }
     }
 
     fn reconnect(self: *Self) !void {
-        log.debug("{} close", .{self.no});
+        // log.debug("{} close", .{self.no});
         try self.loop.close(self.fd);
+        self.fd = -1;
         try self.loop.detach(self);
-        try self.connector.connect();
+        try self.connect();
     }
 };

@@ -80,50 +80,43 @@ const Connection = struct {
         self.ops[0] = try self.loop.recv(self.fd, &self.buffer, self, onRecv);
     }
 
-    fn onRecv(self: *Self, n_err: anyerror!u32) anyerror!void {
-        const n = n_err catch |err| {
-            log.debug("recv {}", .{err});
-            switch (err) {
-                error.ConnectionResetByPeer => {},
-                error.OperationCanceled => {},
-                error.SocketOperationOnNonsocket => {},
-                else => log.err("recv {}", .{err}),
-            }
-            return try self.close();
-        };
-        // log.debug("recv {}", .{n});
-        bytes += n;
-        if (n == 0) return try self.close();
-        self.tail = n;
-        try self.send();
+    fn onRecv(self: *Self, res: io.SyscallError!u32) anyerror!void {
+        if (res) |n| {
+            if (n == 0) return try self.close();
+
+            bytes += n;
+            self.tail = n;
+            try self.send();
+        } else |err| switch (io.SendErrorKind.from(err)) {
+            .close => try self.close(),
+            .interrupt => try self.recv(),
+            .cancel, .unexpected => unreachable,
+        }
     }
 
     fn send(self: *Self) !void {
         self.ops[1] = try self.loop.send(self.fd, self.buffer[self.head..self.tail], self, onSend);
     }
 
-    fn onSend(self: *Self, n_err: anyerror!u32) anyerror!void {
-        self.head += n_err catch |err| {
-            log.debug("send {}", .{err});
-            switch (err) {
-                error.BrokenPipe, error.ConnectionResetByPeer => {},
-                error.OperationCanceled => {},
-                error.SocketOperationOnNonsocket => {},
-                else => log.err("send {}", .{err}),
+    fn onSend(self: *Self, res: io.SyscallError!u32) anyerror!void {
+        if (res) |n| {
+            self.head += n;
+            if (self.head == self.tail) {
+                try self.recv();
+            } else {
+                try self.send();
             }
-            return try self.close();
-        };
-
-        if (self.head == self.tail) {
-            try self.recv();
-        } else {
-            try self.send();
+        } else |err| switch (io.SendErrorKind.from(err)) {
+            .close => try self.close(),
+            .interrupt => try self.send(),
+            .cancel, .unexpected => unreachable,
         }
     }
 
     fn close(self: *Self) !void {
         try self.loop.close(self.fd);
         // log.debug("close {d}", .{self.ops});
+        // TODO: naming
         for (self.ops) |op| try self.loop.detachOp(op, self);
         // try self.loop.detach(self);
         self.allocator.destroy(self);
