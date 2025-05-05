@@ -72,14 +72,11 @@ const Client = struct {
         if (res) |fd| {
             self.fd = fd;
             _ = try self.loop.connect(fd, &self.addr, &self.connect_timeout, self, onConnect);
-        } else |err| {
-            return err;
-        }
+        } else |err| return err;
     }
 
     fn onConnect(self: *Self, res: io.SyscallError!void) anyerror!void {
         if (res) {
-            log.debug("{} connected", .{self.no});
             try self.echo();
         } else |err| switch (io.ConnectErrorKind.from(err)) {
             .again, .interrupt => try self.reconnect(),
@@ -90,8 +87,6 @@ const Client = struct {
 
     // start echo cycle, send random bytes and expect to receive same bytes
     fn echo(self: *Self) !void {
-        // if (self.send_tail > 0)
-        //     log.debug("echo {}", .{self.send_tail});
         self.recv_pos = 0;
         self.send_tail = rnd.intRangeAtMost(u32, 16, 64 * 1024);
         self.send_head = 0;
@@ -102,21 +97,24 @@ const Client = struct {
         _ = try self.loop.send(self.fd, buffer[self.send_head..self.send_tail], self, onSend);
     }
 
+    fn sendResolve(self: *Self, n: u32) !void {
+        self.send_head += n;
+        if (self.send_head == self.send_tail) {
+            try self.recv();
+        } else {
+            // can't happen because we are sending with msg.waitall in Loop.send
+            log.err("{} short send", .{self.no});
+            try self.send();
+        }
+    }
+
     fn onSend(self: *Self, res: io.SyscallError!u32) anyerror!void {
         if (res) |n| {
-            self.send_head += n;
-            if (self.send_head == self.send_tail) {
-                try self.recv();
-            } else {
-                // can't happen because we are sending with msg.waitall in Loop.send
-                log.err("{} short send", .{self.no});
-                try self.send();
-            }
+            try self.sendResolve(n);
         } else |err| switch (io.SendErrorKind.from(err)) {
             .close => try self.reconnect(),
             .interrupt => try self.send(),
-            .cancel => unreachable,
-            .unexpected => unreachable,
+            .cancel, .unexpected => unreachable,
         }
     }
 
@@ -124,22 +122,24 @@ const Client = struct {
         _ = try self.loop.recv(self.fd, &self.buffer, self, onRecv);
     }
 
+    fn recvResolve(self: *Self, n: u32) !void {
+        assert(std.mem.eql(u8, self.buffer[0..n], buffer[self.recv_pos..][0..n]));
+        self.recv_pos += n;
+        if (self.recv_pos == self.send_tail) {
+            try self.echo();
+        } else {
+            try self.recv();
+        }
+    }
+
     fn onRecv(self: *Self, res: io.SyscallError!u32) anyerror!void {
         if (res) |n| {
             if (n == 0) return try self.reconnect();
-
-            assert(std.mem.eql(u8, self.buffer[0..n], buffer[self.recv_pos..][0..n]));
-            self.recv_pos += n;
-            if (self.recv_pos == self.send_tail) {
-                try self.echo();
-            } else {
-                try self.recv();
-            }
+            try self.recvResolve(n);
         } else |err| switch (io.RecvErrorKind.from(err)) {
             .close => try self.reconnect(),
             .interrupt => try self.recv(),
-            .cancel => unreachable,
-            .unexpected => unreachable,
+            .cancel, .unexpected => unreachable,
         }
     }
 

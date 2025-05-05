@@ -80,13 +80,16 @@ const Connection = struct {
         self.ops[0] = try self.loop.recv(self.fd, &self.buffer, self, onRecv);
     }
 
+    fn recvResolve(self: *Self, n: u32) !void {
+        bytes += n;
+        self.tail = n;
+        try self.send();
+    }
+
     fn onRecv(self: *Self, res: io.SyscallError!u32) anyerror!void {
         if (res) |n| {
             if (n == 0) return try self.close();
-
-            bytes += n;
-            self.tail = n;
-            try self.send();
+            try self.recvResolve(n);
         } else |err| switch (io.SendErrorKind.from(err)) {
             .close => try self.close(),
             .interrupt => try self.recv(),
@@ -98,14 +101,18 @@ const Connection = struct {
         self.ops[1] = try self.loop.send(self.fd, self.buffer[self.head..self.tail], self, onSend);
     }
 
+    fn sendResolve(self: *Self, n: u32) !void {
+        self.head += n;
+        if (self.head == self.tail) {
+            try self.recv();
+        } else {
+            try self.send();
+        }
+    }
+
     fn onSend(self: *Self, res: io.SyscallError!u32) anyerror!void {
         if (res) |n| {
-            self.head += n;
-            if (self.head == self.tail) {
-                try self.recv();
-            } else {
-                try self.send();
-            }
+            try self.sendResolve(n);
         } else |err| switch (io.SendErrorKind.from(err)) {
             .close => try self.close(),
             .interrupt => try self.send(),
@@ -115,10 +122,7 @@ const Connection = struct {
 
     fn close(self: *Self) !void {
         try self.loop.close(self.fd);
-        // log.debug("close {d}", .{self.ops});
-        // TODO: naming
         for (self.ops) |op| try self.loop.detachOp(op, self);
-        // try self.loop.detach(self);
         self.allocator.destroy(self);
     }
 };
