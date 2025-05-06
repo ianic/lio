@@ -77,15 +77,15 @@ pub const Listener = struct {
     loop: *io.Loop,
     addr: std.net.Address,
     context: *anyopaque,
-    onConnect: *const fn (*Self, anyerror!linux.fd_t) anyerror!void,
-    fd: ?linux.fd_t = null, // listening socket
+    onConnect: *const fn (*Self, io.SyscallError!linux.fd_t) anyerror!void,
+    fd: linux.fd_t = -1,
 
     pub fn init(
         self: *Self,
         loop: *io.Loop,
         addr: std.net.Address,
         context: anytype,
-        comptime onConnect: *const fn (@TypeOf(context), anyerror!linux.fd_t) anyerror!void,
+        comptime onConnect: *const fn (@TypeOf(context), io.SyscallError!linux.fd_t) anyerror!void,
     ) !void {
         self.* = .{
             .loop = loop,
@@ -93,50 +93,62 @@ pub const Listener = struct {
             .context = context,
             .onConnect = struct {
                 const Context = @TypeOf(context);
-                fn wrap(slf: *Self, fd_err: anyerror!linux.fd_t) anyerror!void {
+                fn wrap(slf: *Self, fd_err: io.SyscallError!linux.fd_t) anyerror!void {
                     const ctx: Context = @alignCast(@ptrCast(slf.context));
                     try onConnect(ctx, fd_err);
                 }
             }.wrap,
         };
-        _ = try self.loop.socket(self.addr.any.family, linux.SOCK.STREAM, self, onSocket);
+        try self.listenSubmit();
+        //_ = try self.loop.socket(self.addr.any.family, linux.SOCK.STREAM, self, onSocket);
     }
 
-    fn onSocket(self: *Self, fd_err: anyerror!linux.fd_t) anyerror!void {
-        if (fd_err) |fd| {
-            self.fd = fd;
-            _ = self.loop.listen(fd, &self.addr, .{ .reuse_address = true }, self, onListen) catch |err| {
-                return try self.onConnect(self, err);
-            };
-        } else |err| {
-            try self.onConnect(self, err);
-        }
-    }
+    fn listenSubmit(self: *Self) !void {
+        assert(self.fd < 0);
+        const wrap = struct {
+            fn socketComplete(self_: *Self, res: io.SyscallError!linux.fd_t) anyerror!void {
+                if (res) |fd| {
+                    self_.fd = fd;
+                    _ = try self_.loop.listen(fd, &self_.addr, .{ .reuse_address = true }, self_, @This().listenComplete);
+                } else |err| switch (err) {
+                    error.OperationCanceled,
+                    error.InterruptedSystemCall,
+                    => try self_.listenSubmit(),
+                    else => return err,
+                }
+            }
 
-    fn onListen(self: *Self, _err: anyerror!void) anyerror!void {
-        if (_err) |_| {
-            try self.accept();
-        } else |err| {
-            try self.onConnect(self, err);
-        }
-    }
-
-    fn onAccept(self: *Self, fd_err: anyerror!linux.fd_t) anyerror!void {
-        try self.onConnect(self, fd_err);
-        try self.accept();
-    }
-
-    fn accept(self: *Self) !void {
-        _ = self.loop.accept(self.fd.?, self, onAccept) catch |err| {
-            return try self.onConnect(self, err);
+            fn listenComplete(self_: *Self, res: io.SyscallError!void) anyerror!void {
+                if (res)
+                    try self_.acceptSubmit()
+                else |err| switch (err) {
+                    error.OperationCanceled,
+                    error.InterruptedSystemCall,
+                    => try self_.retry(),
+                    else => return err,
+                }
+            }
         };
+        _ = try self.loop.socket(self.addr.any.family, linux.SOCK.STREAM, self, wrap.socketComplete);
+    }
+
+    fn acceptSubmit(self: *Self) !void {
+        _ = try self.loop.accept(self.fd, self, struct {
+            fn complete(self_: *Self, fd_err: io.SyscallError!linux.fd_t) anyerror!void {
+                try self_.onConnect(self_, fd_err);
+                try self_.acceptSubmit();
+            }
+        }.complete);
+    }
+
+    fn retry(self: *Self) !void {
+        try self.close();
+        try self.listenSubmit();
     }
 
     pub fn close(self: *Self) !void {
-        if (self.fd) |fd| {
-            _ = try self.loop.close(fd);
-            self.fd = null;
-        }
+        _ = try self.loop.close(self.fd);
+        self.fd = -1;
         try self.loop.detach(self);
     }
 };

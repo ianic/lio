@@ -60,29 +60,44 @@ const Client = struct {
             .addr = addr,
             .no = no,
         };
-        try self.connect();
+        try self.connectSubmit();
     }
 
-    fn connect(self: *Self) !void {
+    fn connectSubmit(self: *Self) !void {
         assert(self.fd < 0);
-        _ = try self.loop.socket(self.addr.any.family, linux.SOCK.STREAM, self, onSocket);
+        const wrap = struct {
+            fn socketComplete(self_: *Self, res: io.SyscallError!linux.fd_t) anyerror!void {
+                if (res) |fd| {
+                    self_.fd = fd;
+                    _ = try self_.loop.connect(fd, &self_.addr, &self_.connect_timeout, self_, @This().connectComplete);
+                } else |err| switch (err) {
+                    error.InterruptedSystemCall => try self_.connectSubmit(),
+                    else => return err,
+                }
+            }
+
+            fn connectComplete(self_: *Self, res: io.SyscallError!void) anyerror!void {
+                if (res)
+                    try self_.connectResolve()
+                else |err| switch (err) {
+                    error.OperationCanceled, // connect timeout
+                    error.InterruptedSystemCall,
+                    // Network errors
+                    error.ConnectionRefused, // ECONNREFUSED
+                    error.NetworkIsUnreachable, // ENETUNREACH
+                    error.NoRouteToHost, // EHOSTUNREACH
+                    error.ConnectionTimedOut, // ETIMEDOUT
+                    error.ConnectionResetByPeer, // ECONNRESET
+                    => try self_.reconnect(),
+                    else => return err,
+                }
+            }
+        };
+        _ = try self.loop.socket(self.addr.any.family, linux.SOCK.STREAM, self, wrap.socketComplete);
     }
 
-    fn onSocket(self: *Self, res: anyerror!linux.fd_t) anyerror!void {
-        if (res) |fd| {
-            self.fd = fd;
-            _ = try self.loop.connect(fd, &self.addr, &self.connect_timeout, self, onConnect);
-        } else |err| return err;
-    }
-
-    fn onConnect(self: *Self, res: io.SyscallError!void) anyerror!void {
-        if (res) {
-            try self.echo();
-        } else |err| switch (io.ConnectErrorKind.from(err)) {
-            .again, .interrupt => try self.reconnect(),
-            .cancel => unreachable,
-            .unexpected => return err,
-        }
+    fn connectResolve(self: *Self) !void {
+        try self.echo();
     }
 
     // start echo cycle, send random bytes and expect to receive same bytes
@@ -90,56 +105,60 @@ const Client = struct {
         self.recv_pos = 0;
         self.send_tail = rnd.intRangeAtMost(u32, 16, 64 * 1024);
         self.send_head = 0;
-        try self.send();
+        try self.sendSubmit();
     }
 
-    fn send(self: *Self) !void {
-        _ = try self.loop.send(self.fd, buffer[self.send_head..self.send_tail], self, onSend);
+    fn sendSubmit(self: *Self) !void {
+        _ = try self.loop.send(self.fd, buffer[self.send_head..self.send_tail], self, struct {
+            fn complete(self_: *Self, res: io.SyscallError!u32) anyerror!void {
+                if (res) |n|
+                    try self_.sendResolve(n)
+                else |err| switch (err) {
+                    error.BrokenPipe,
+                    error.ConnectionResetByPeer,
+                    => try self_.reconnect(),
+                    error.InterruptedSystemCall => try self_.sendSubmit(),
+                    error.OperationCanceled => unreachable,
+                    else => return err,
+                }
+            }
+        }.complete);
     }
 
     fn sendResolve(self: *Self, n: u32) !void {
         self.send_head += n;
         if (self.send_head == self.send_tail) {
-            try self.recv();
+            try self.recvSubmit();
         } else {
             // can't happen because we are sending with msg.waitall in Loop.send
             log.err("{} short send", .{self.no});
-            try self.send();
+            try self.sendSubmit();
         }
     }
 
-    fn onSend(self: *Self, res: io.SyscallError!u32) anyerror!void {
-        if (res) |n| {
-            try self.sendResolve(n);
-        } else |err| switch (io.SendErrorKind.from(err)) {
-            .close => try self.reconnect(),
-            .interrupt => try self.send(),
-            .cancel, .unexpected => unreachable,
-        }
-    }
-
-    fn recv(self: *Self) !void {
-        _ = try self.loop.recv(self.fd, &self.buffer, self, onRecv);
+    fn recvSubmit(self: *Self) !void {
+        _ = try self.loop.recv(self.fd, &self.buffer, self, struct {
+            fn complete(self_: *Self, res: io.SyscallError!u32) anyerror!void {
+                if (res) |n|
+                    try self_.recvResolve(n)
+                else |err| switch (err) {
+                    error.ConnectionResetByPeer => try self_.reconnect(),
+                    error.InterruptedSystemCall => try self_.recvSubmit(),
+                    error.OperationCanceled => unreachable,
+                    else => return err,
+                }
+            }
+        }.complete);
     }
 
     fn recvResolve(self: *Self, n: u32) !void {
+        if (n == 0) return try self.reconnect();
         assert(std.mem.eql(u8, self.buffer[0..n], buffer[self.recv_pos..][0..n]));
         self.recv_pos += n;
         if (self.recv_pos == self.send_tail) {
             try self.echo();
         } else {
-            try self.recv();
-        }
-    }
-
-    fn onRecv(self: *Self, res: io.SyscallError!u32) anyerror!void {
-        if (res) |n| {
-            if (n == 0) return try self.reconnect();
-            try self.recvResolve(n);
-        } else |err| switch (io.RecvErrorKind.from(err)) {
-            .close => try self.reconnect(),
-            .interrupt => try self.recv(),
-            .cancel, .unexpected => unreachable,
+            try self.recvSubmit();
         }
     }
 
@@ -148,6 +167,6 @@ const Client = struct {
         try self.loop.close(self.fd);
         self.fd = -1;
         try self.loop.detach(self);
-        try self.connect();
+        try self.connectSubmit();
     }
 };

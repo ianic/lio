@@ -52,8 +52,7 @@ next_op_idx: usize = 0,
 metric: struct {
     active_op: usize = 0,
 } = .{},
-tick_timer_ts: linux.kernel_timespec = .{ .sec = 0, .nsec = 0 },
-tick_timer: usize = 0,
+tick_timer_ts: ?linux.kernel_timespec = null,
 next_buffer_group_id: u16 = 0,
 
 //TODO: add all tcp structs or remove
@@ -65,7 +64,7 @@ pub const Tcp = struct {
         listener: *Listener,
         addr: std.net.Address,
         context: anytype,
-        comptime onConnect: *const fn (@TypeOf(context), anyerror!linux.fd_t) anyerror!void,
+        comptime onConnect: *const fn (@TypeOf(context), SyscallError!linux.fd_t) anyerror!void,
     ) !void {
         const loop: *Loop = @alignCast(@fieldParentPtr("tcp", self));
         try listener.init(loop, addr, context, onConnect);
@@ -122,7 +121,7 @@ fn processReadyCompletions(self: *Loop) !bool {
             continue;
         }
         if (cqe.user_data == timer_user_data) {
-            self.tick_timer +%= 1;
+            self.tick_timer_ts = null;
             completed += 1;
             continue;
         }
@@ -146,12 +145,13 @@ pub fn tick(self: *Loop) !void {
 }
 
 pub fn runFor(self: *Loop, ms: u64) !void {
-    const sec = ms / std.time.ms_per_s;
-    const nsec = (ms - sec * std.time.ms_per_s) * std.time.ns_per_ms;
-    self.tick_timer_ts = .{ .sec = @intCast(sec), .nsec = @intCast(nsec) };
-    try self.tickTimer(&self.tick_timer_ts);
-    const current = self.tick_timer;
-    while (current == self.tick_timer) {
+    if (self.tick_timer_ts == null) {
+        const sec = ms / std.time.ms_per_s;
+        const nsec = (ms - sec * std.time.ms_per_s) * std.time.ns_per_ms;
+        self.tick_timer_ts = .{ .sec = @intCast(sec), .nsec = @intCast(nsec) };
+        try self.tickTimer(&self.tick_timer_ts.?);
+    }
+    while (self.tick_timer_ts != null) {
         _ = try self.ring.submit_and_wait(1);
         try self.processCompletions();
     }
@@ -243,12 +243,14 @@ fn prepareOp(
     return idx;
 }
 
+/// Get io_uring direct socket. If there are no free socket we will get:
+/// error.FileTableOverflow.
 pub fn socket(
     self: *Loop,
     domain: u32,
     socket_type: u32,
     context: anytype,
-    comptime onComplete: fn (@TypeOf(context), anyerror!linux.fd_t) anyerror!void,
+    comptime onComplete: fn (@TypeOf(context), SyscallError!linux.fd_t) anyerror!void,
 ) PrepareError!usize {
     const wrap = struct {
         fn callback(op: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
@@ -268,6 +270,7 @@ pub fn socket(
     return op_idx;
 }
 
+/// error.AddressAlreadyInUse
 pub fn listen(
     self: *Loop,
     fd: linux.fd_t,
@@ -275,7 +278,7 @@ pub fn listen(
     addr: *std.net.Address,
     opt: std.net.Address.ListenOptions,
     context: anytype,
-    comptime onComplete: fn (@TypeOf(context), anyerror!void) anyerror!void,
+    comptime onComplete: fn (@TypeOf(context), SyscallError!void) anyerror!void,
 ) PrepareError!usize {
     const wrap = struct {
         fn callback(op: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
@@ -306,6 +309,23 @@ pub fn listen(
     return op_idx;
 }
 
+/// General syscall errors:
+///   error.OperationCanceled
+///   error.InterruptedSystemCall
+/// Connect spevific syscall errors to handle:
+/// ref: https://man7.org/linux/man-pages/man2/connect.2.html
+/// Network errors
+///   error.ConnectionRefused, // ECONNREFUSED
+///   error.NetworkIsUnreachable, // ENETUNREACH
+///   error.NoRouteToHost, // EHOSTUNREACH
+///   error.ConnectionTimedOut, // ETIMEDOUT
+///   error.ConnectionResetByPeer, // ECONNRESET
+/// Other documented to consider
+///   error.AddressAlreadyInUse, // EADDRINUSE
+///   error.OperationAlreadyInProgress, // EALREADY
+///   error.OperationNowInProgress, // EINPROGRESS
+///   error.TryAgain, // EAGAIN
+///   error.TransportEndpointIsAlreadyConnected, //  EISCONN
 pub fn connect(
     self: *Loop,
     fd: linux.fd_t,
@@ -359,6 +379,11 @@ pub fn accept(
     return op_idx;
 }
 
+/// Returns 0 on graceful shutdown.
+/// error.ConnectionResetByPeer when remote host sends RST packet
+/// Common syscall errors to handle:
+/// error.OperationCanceled
+/// error.InterruptedSystemCall
 pub fn recv(
     self: *Loop,
     fd: linux.fd_t,
@@ -383,6 +408,12 @@ pub fn recv(
     return op_idx;
 }
 
+/// Send on closed socket will return:
+/// error.BrokenPipe - send on closed socket
+/// error.ConnectionResetByPeer - send on forcefully closed socket (RST)
+/// Common syscall errors to handle:
+/// error.OperationCanceled
+/// error.InterruptedSystemCall
 pub fn send(
     self: *Loop,
     fd: linux.fd_t,
@@ -465,7 +496,7 @@ test "socket" {
     var ops: [1]Op = undefined;
     var loop = try Loop.init(.{
         .entries = 1,
-        .fd_nr = 2,
+        .fd_nr = 1,
         .op_list = &ops,
     });
     defer loop.deinit();
@@ -746,4 +777,47 @@ fn testSend(addr: std.net.Address) void {
 
 test "size" {
     try testing.expectEqual(16, @sizeOf(Op));
+}
+
+test "moze li to ovako" {
+    const E = union(enum) {
+        success: u32,
+        close: anyerror,
+        interrupt: anyerror,
+        unknown: usize,
+    };
+    //const e: E = .{ .success = 12 };
+    const e: E = .{ .close = error.ConnectionClosed };
+
+    switch (e) {
+        .success => |n| std.debug.print("n={}\n", .{n}),
+        .close => |err| std.debug.print("reject with {}\n", .{err}),
+        else => |err| std.debug.print("reject with {}\n", .{err}),
+    }
+}
+
+test "ili mozda ovako" {
+    const E = union(enum) {
+        resolve: u32,
+        reject: struct {
+            kind: enum {
+                close,
+                interrupt,
+            },
+            err: anyerror,
+        },
+    };
+
+    //const e: E = .{ .resolve = 122 };
+    const e: E = .{ .reject = .{ .err = error.Pero, .kind = .close } };
+    switch (e) {
+        .resolve => |n| std.debug.print("resolve with n={}\n", .{n}),
+        .reject => |r| {
+            std.debug.print("reject with error {}\n", .{r.err});
+            switch (r.kind) {
+                .close => std.debug.print("je stvarno je bio close\n", .{}),
+                else => {},
+            }
+        },
+    }
 }
