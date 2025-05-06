@@ -55,22 +55,6 @@ metric: struct {
 tick_timer_ts: ?linux.kernel_timespec = null,
 next_buffer_group_id: u16 = 0,
 
-//TODO: add all tcp structs or remove
-tcp: Tcp = .{},
-pub const Tcp = struct {
-    pub const Listener = @import("tcp.zig").Listener;
-    pub fn listen(
-        self: *@This(),
-        listener: *Listener,
-        addr: std.net.Address,
-        context: anytype,
-        comptime onConnect: *const fn (@TypeOf(context), SyscallError!linux.fd_t) anyerror!void,
-    ) !void {
-        const loop: *Loop = @alignCast(@fieldParentPtr("tcp", self));
-        try listener.init(loop, addr, context, onConnect);
-    }
-};
-
 pub fn init(opt: Options) !Loop {
     var ring = try linux.IoUring.init(opt.entries, opt.flags);
     errdefer ring.deinit();

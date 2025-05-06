@@ -116,7 +116,7 @@ pub fn build(b: *std.Build) void {
 
     // Build all from test/ path
     const examples = [_][]const u8{
-        "interrupt",
+        //"interrupt",
         "tcp_echo_server",
         "tcp_echo_client",
     };
