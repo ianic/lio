@@ -124,12 +124,7 @@ const Listener = struct {
     fn acceptResolve(self: *Self, fd: posix.fd_t) !void {
         const conn = try self.allocator.create(Connection);
         errdefer self.allocator.destroy(conn);
-        conn.* = .{
-            .allocator = self.allocator,
-            .loop = self.loop,
-            .fd = fd,
-        };
-        try conn.recvSubmit();
+        try conn.init(self, fd);
     }
 
     fn retry(self: *Self) !void {
@@ -142,23 +137,33 @@ const Listener = struct {
         self.fd = -1;
         try self.loop.detach(self);
     }
+
+    fn destroy(self: *Self, conn: *Connection) void {
+        self.allocator.destroy(conn);
+    }
 };
 
 const Connection = struct {
     const Self = @This();
 
-    allocator: mem.Allocator,
-    loop: *io.Loop,
+    parent: *Listener,
     fd: linux.fd_t,
+    ops: [2]usize = undefined,
+
     buffer: [1024 * 64]u8 = undefined,
     head: u32 = 0,
     tail: u32 = 0,
-    ops: [2]usize = undefined,
+
+    pub fn init(self: *Self, parent: *Listener, fd: linux.fd_t) !void {
+        self.* = .{
+            .fd = fd,
+            .parent = parent,
+        };
+        try self.recvSubmit();
+    }
 
     fn recvSubmit(self: *Self) !void {
-        self.head = 0;
-        self.tail = 0;
-        self.ops[0] = try self.loop.recv(self.fd, &self.buffer, self, struct {
+        self.ops[0] = try self.parent.loop.recv(self.fd, &self.buffer, self, struct {
             fn complete(self_: *Self, res: io.SyscallError!u32) anyerror!void {
                 if (res) |n|
                     try self_.recvResolve(n)
@@ -173,13 +178,15 @@ const Connection = struct {
     }
 
     fn recvResolve(self: *Self, n: u32) !void {
+        if (n == 0) return try self.close();
         bytes += n;
+        self.head = 0;
         self.tail = n;
         try self.sendSubmit();
     }
 
     fn sendSubmit(self: *Self) !void {
-        self.ops[1] = try self.loop.send(self.fd, self.buffer[self.head..self.tail], self, struct {
+        self.ops[1] = try self.parent.loop.send(self.fd, self.buffer[self.head..self.tail], self, struct {
             fn complete(self_: *Self, res: io.SyscallError!u32) anyerror!void {
                 if (res) |n|
                     try self_.sendResolve(n)
@@ -196,7 +203,6 @@ const Connection = struct {
     }
 
     fn sendResolve(self: *Self, n: u32) !void {
-        if (n == 0) return try self.close();
         self.head += n;
         if (self.head == self.tail) {
             try self.recvSubmit();
@@ -206,8 +212,8 @@ const Connection = struct {
     }
 
     fn close(self: *Self) !void {
-        try self.loop.close(self.fd);
-        for (self.ops) |op| try self.loop.detachOp(op, self);
-        self.allocator.destroy(self);
+        try self.parent.loop.close(self.fd);
+        for (self.ops) |op| try self.parent.loop.detachOp(op, self);
+        self.parent.destroy(self);
     }
 };
