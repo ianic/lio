@@ -3,6 +3,8 @@ const assert = std.debug.assert;
 const linux = std.os.linux;
 const io = @import("root.zig");
 
+const log = std.log.scoped(.tcp);
+
 pub fn Connector(comptime Parent: type, comptime parent_field_name: []const u8) type {
     return struct {
         const Self = @This();
@@ -18,54 +20,138 @@ pub fn Connector(comptime Parent: type, comptime parent_field_name: []const u8) 
         }
 
         pub fn init(loop: *io.Loop, addr: std.net.Address) Self {
-            return .{
-                .loop = loop,
-                .addr = addr,
-            };
+            return .{ .loop = loop, .addr = addr };
         }
 
         pub fn connect(self: *Self) !void {
             if (self.fd >= 0) try self.close();
-            try self.connectSubmit();
+            try self.socketSubmit();
         }
 
-        fn connectSubmit(self: *Self) !void {
+        fn socketSubmit(self: *Self) !void {
             assert(self.fd < 0);
-            const wrap = struct {
-                fn socketComplete(self_: *Self, res: io.SyscallError!linux.fd_t) anyerror!void {
-                    if (res) |fd| {
-                        self_.fd = fd;
-                        self_.op = try self_.loop.connect(fd, &self_.addr, &self_.connect_timeout, self_, @This().connectComplete);
-                    } else |err| switch (err) {
-                        error.InterruptedSystemCall => try self_.connectSubmit(),
-                        else => return err,
-                    }
-                }
+            self.op = try self.loop.socket(self.addr.any.family, linux.SOCK.STREAM, self, socketComplete);
+        }
 
-                fn connectComplete(self_: *Self, res: io.SyscallError!void) anyerror!void {
-                    if (res) {
-                        try self_.parent().onConnect(self_.fd);
-                        self_.fd = -2;
-                    } else |err| switch (err) {
-                        error.OperationCanceled, // connect timeout
-                        error.InterruptedSystemCall,
-                        // Network errors
-                        error.ConnectionRefused, // ECONNREFUSED
-                        error.NetworkIsUnreachable, // ENETUNREACH
-                        error.NoRouteToHost, // EHOSTUNREACH
-                        error.ConnectionTimedOut, // ETIMEDOUT
-                        error.ConnectionResetByPeer, // ECONNRESET
-                        => try self_.connect(),
-                        else => return err,
-                    }
-                }
-            };
-            self.op = try self.loop.socket(self.addr.any.family, linux.SOCK.STREAM, self, wrap.socketComplete);
+        fn socketComplete(self: *Self, res: io.SyscallError!linux.fd_t) anyerror!void {
+            if (res) |fd| {
+                self.fd = fd;
+                self.op = try self.loop.connect(fd, &self.addr, &self.connect_timeout, self, connectComplete);
+            } else |err| switch (err) {
+                error.InterruptedSystemCall => try self.socketSubmit(),
+                else => return err,
+            }
+        }
+
+        fn connectComplete(self: *Self, res: io.SyscallError!void) anyerror!void {
+            if (res) {
+                try self.parent().onConnect(self.fd);
+                self.fd = -2;
+            } else |err| switch (err) {
+                error.OperationCanceled, // connect timeout
+                error.InterruptedSystemCall,
+                // Network errors
+                error.ConnectionRefused, // ECONNREFUSED
+                error.NetworkIsUnreachable, // ENETUNREACH
+                error.NoRouteToHost, // EHOSTUNREACH
+                error.ConnectionTimedOut, // ETIMEDOUT
+                error.ConnectionResetByPeer, // ECONNRESET
+                => try self.connect(),
+                else => return err,
+            }
         }
 
         pub fn close(self: *Self) !void {
             if (self.fd < 0) return;
             try self.loop.close(self.fd);
+            self.fd = -1;
+            try self.loop.detachOp(self.op, self);
+        }
+    };
+}
+
+pub fn Listener(comptime Parent: type, comptime parent_field_name: []const u8) type {
+    return struct {
+        const Self = @This();
+
+        loop: *io.Loop,
+        addr: std.net.Address,
+        fd: linux.fd_t = -1,
+        listen_options: std.net.Address.ListenOptions = .{ .reuse_address = true },
+        op: usize = 0,
+
+        inline fn parent(self: *Self) *Parent {
+            return @alignCast(@fieldParentPtr(parent_field_name, self));
+        }
+
+        pub fn init(loop: *io.Loop, addr: std.net.Address) Self {
+            return .{ .loop = loop, .addr = addr };
+        }
+
+        pub fn listen(self: *Self) !void {
+            assert(self.fd == -1);
+            try self.socketSubmit();
+        }
+
+        fn socketSubmit(self: *Self) !void {
+            assert(self.fd < 0);
+            self.op = try self.loop.socket(self.addr.any.family, linux.SOCK.STREAM, self, socketComplete);
+        }
+
+        fn socketComplete(self: *Self, res: io.SyscallError!linux.fd_t) anyerror!void {
+            if (res) |fd| {
+                self.fd = fd;
+                self.op = try self.loop.listen(fd, &self.addr, self.listen_options, self, listenComplete);
+            } else |err| switch (err) {
+                error.InterruptedSystemCall => try self.socketSubmit(),
+                else => return err,
+            }
+        }
+
+        fn listenComplete(self: *Self, res: io.SyscallError!void) anyerror!void {
+            if (res)
+                try self.acceptSubmit()
+            else |err| {
+                switch (err) {
+                    error.InterruptedSystemCall => {},
+                    error.AddressAlreadyInUse => {
+                        log.err("listen {} {}", .{ self.addr, err });
+                    },
+                    else => return err,
+                }
+                try self.close();
+                try self.socketSubmit();
+            }
+        }
+
+        fn acceptSubmit(self: *Self) !void {
+            self.op = try self.loop.accept(self.fd, self, acceptComplete);
+        }
+
+        fn acceptComplete(self: *Self, res: io.SyscallError!linux.fd_t) anyerror!void {
+            if (res) |fd|
+                self.parent().onAccept(fd) catch |err| {
+                    log.err("accept resolve {}", .{err});
+                    self.loop.close(fd) catch {};
+                }
+            else |err| switch (err) {
+                error.InterruptedSystemCall => {},
+                error.SoftwareCausedConnectionAbort, // ECONNABORTED
+                error.NoBufferSpaceAvailable, // ENOBUFS
+                // No more fixed file descriptors, this connection if not
+                // accepted but we can continue working.
+                error.FileTableOverflow,
+                => {
+                    log.warn("accept {} {}", .{ self.addr, err });
+                },
+                else => return err,
+            }
+            try self.acceptSubmit();
+        }
+
+        pub fn close(self: *Self) !void {
+            if (self.fd < 0) return;
+            _ = try self.loop.close(self.fd);
             self.fd = -1;
             try self.loop.detachOp(self.op, self);
         }
@@ -135,4 +221,10 @@ pub fn Connection(comptime Parent: type, comptime parent_field_name: []const u8)
             try self.parent().onClose();
         }
     };
+}
+
+test "sizeOf" {
+    const T = struct {};
+    try std.testing.expectEqual(144, @sizeOf(Listener(T, "")));
+    try std.testing.expectEqual(152, @sizeOf(Connector(T, "")));
 }
