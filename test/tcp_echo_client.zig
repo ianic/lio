@@ -31,34 +31,30 @@ pub fn main() !void {
 
     const addr: std.net.Address = try std.net.Address.resolveIp("127.0.0.1", 9900);
 
-    var clients: [24]Client = undefined;
+    var clients: [24]Connector = undefined;
     for (&clients, 0..) |*cli, no| {
-        try cli.init(&loop, addr, no);
+        _ = no;
+        try cli.init(&loop, addr);
     }
 
     while (true)
         try loop.tick();
 }
 
-const Client = struct {
+const Connector = struct {
     const Self = @This();
 
     loop: *io.Loop,
     addr: std.net.Address,
-    no: usize,
     connect_timeout: linux.kernel_timespec = .{ .sec = 10, .nsec = 0 },
-
     fd: linux.fd_t = -1,
-    buffer: [64 * 1024]u8 = undefined,
-    send_head: u32 = 0,
-    send_tail: u32 = 0,
-    recv_pos: u32 = 0,
+    conn: Connection = undefined,
+    op: usize = 0,
 
-    fn init(self: *Self, loop: *io.Loop, addr: std.net.Address, no: usize) !void {
+    pub fn init(self: *Self, loop: *io.Loop, addr: std.net.Address) !void {
         self.* = .{
             .loop = loop,
             .addr = addr,
-            .no = no,
         };
         try self.connectSubmit();
     }
@@ -69,7 +65,7 @@ const Client = struct {
             fn socketComplete(self_: *Self, res: io.SyscallError!linux.fd_t) anyerror!void {
                 if (res) |fd| {
                     self_.fd = fd;
-                    _ = try self_.loop.connect(fd, &self_.addr, &self_.connect_timeout, self_, @This().connectComplete);
+                    self_.op = try self_.loop.connect(fd, &self_.addr, &self_.connect_timeout, self_, @This().connectComplete);
                 } else |err| switch (err) {
                     error.InterruptedSystemCall => try self_.connectSubmit(),
                     else => return err,
@@ -93,14 +89,48 @@ const Client = struct {
                 }
             }
         };
-        _ = try self.loop.socket(self.addr.any.family, linux.SOCK.STREAM, self, wrap.socketComplete);
+        self.op = try self.loop.socket(self.addr.any.family, linux.SOCK.STREAM, self, wrap.socketComplete);
     }
 
     fn connectResolve(self: *Self) !void {
+        try self.conn.init(self, self.fd);
+        self.fd = -2;
+    }
+
+    fn close(self: *Self) !void {
+        try self.loop.close(self.fd);
+        self.fd = -1;
+        try self.loop.detachOp(self.op, self);
+    }
+
+    fn reconnect(self: *Self) !void {
+        if (self.fd >= 0) try self.close();
+        try self.connectSubmit();
+    }
+};
+
+const Connection = struct {
+    const Self = @This();
+
+    parent: *Connector,
+    loop: *io.Loop,
+    fd: linux.fd_t = -1,
+
+    buffer: [64 * 1024]u8 = undefined,
+    send_head: u32 = 0,
+    send_tail: u32 = 0,
+    recv_pos: u32 = 0,
+
+    fn init(self: *Self, parent: *Connector, fd: linux.fd_t) !void {
+        self.* = .{
+            .parent = parent,
+            .loop = parent.loop,
+            .fd = fd,
+        };
         try self.echo();
     }
 
-    // start echo cycle, send random bytes and expect to receive same bytes
+    // Start echo cycle, send random bytes and expect to receive same bytes
     fn echo(self: *Self) !void {
         self.recv_pos = 0;
         self.send_tail = rnd.intRangeAtMost(u32, 16, 64 * 1024);
@@ -116,7 +146,7 @@ const Client = struct {
                 else |err| switch (err) {
                     error.BrokenPipe,
                     error.ConnectionResetByPeer,
-                    => try self_.reconnect(),
+                    => try self_.close(),
                     error.InterruptedSystemCall => try self_.sendSubmit(),
                     error.OperationCanceled => unreachable,
                     else => return err,
@@ -131,7 +161,7 @@ const Client = struct {
             try self.recvSubmit();
         } else {
             // can't happen because we are sending with msg.waitall in Loop.send
-            log.err("{} short send", .{self.no});
+            // log.err("{} short send", .{self.no});
             try self.sendSubmit();
         }
     }
@@ -142,7 +172,7 @@ const Client = struct {
                 if (res) |n|
                     try self_.recvResolve(n)
                 else |err| switch (err) {
-                    error.ConnectionResetByPeer => try self_.reconnect(),
+                    error.ConnectionResetByPeer => try self_.close(),
                     error.InterruptedSystemCall => try self_.recvSubmit(),
                     error.OperationCanceled => unreachable,
                     else => return err,
@@ -152,7 +182,7 @@ const Client = struct {
     }
 
     fn recvResolve(self: *Self, n: u32) !void {
-        if (n == 0) return try self.reconnect();
+        if (n == 0) return try self.close();
         assert(std.mem.eql(u8, self.buffer[0..n], buffer[self.recv_pos..][0..n]));
         self.recv_pos += n;
         if (self.recv_pos == self.send_tail) {
@@ -162,11 +192,9 @@ const Client = struct {
         }
     }
 
-    fn reconnect(self: *Self) !void {
-        // log.debug("{} close", .{self.no});
+    fn close(self: *Self) !void {
         try self.loop.close(self.fd);
-        self.fd = -1;
         try self.loop.detach(self);
-        try self.connectSubmit();
+        try self.parent.reconnect();
     }
 };

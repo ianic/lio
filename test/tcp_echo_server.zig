@@ -113,7 +113,6 @@ const Listener = struct {
                     => {
                         log.warn("accept {} {}", .{ self_.addr, err });
                     },
-
                     else => return err,
                 }
                 try self_.acceptSubmit();
