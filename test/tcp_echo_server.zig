@@ -27,11 +27,19 @@ pub fn main() !void {
     };
     listener.tcp.listen();
 
+    var prev_metric = loop.metric;
     var i: usize = 1;
     while (true) : (i +%= 1) {
         try loop.runFor(1000);
-        log.debug("run: {} bytes: {} MB: {}", .{ i, bytes, bytes / 1000_000 });
+        log.debug("run: {} bytes: {} MB: {} ops: {} active: {}", .{
+            i,
+            bytes,
+            bytes / 1000_000,
+            loop.metric.processed_op -% prev_metric.processed_op,
+            loop.metric.active_op,
+        });
         bytes = 0;
+        prev_metric = loop.metric;
     }
 
     try listener.close();

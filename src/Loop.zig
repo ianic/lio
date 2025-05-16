@@ -1,8 +1,8 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
-const testing = std.testing;
 const mem = std.mem;
+const testing = std.testing;
 
 const SyscallError = @import("errno.zig").Error;
 
@@ -24,10 +24,10 @@ pub const Options = struct {
 
 pub const Op = struct {
     ptr: ?*anyopaque = null,
-    callback: *const fn (*Op, *Loop, linux.io_uring_cqe) void = noopCallback,
+    callback: *const fn (Op, linux.io_uring_cqe) void = noopCallback,
 
     const noopCallback = struct {
-        fn noop(_: *Op, _: *Loop, _: linux.io_uring_cqe) void {}
+        fn noop(_: Op, _: linux.io_uring_cqe) void {}
     }.noop;
 
     /// Replace callback with noop callback. Enables ptr to be destroyed.
@@ -48,8 +48,10 @@ ring: linux.IoUring,
 op_list: std.ArrayList(Op),
 next_op_idx: usize = 0,
 metric: struct {
-    /// Number of in kernel operations
+    /// Current number of in kernel operations
     active_op: usize = 0,
+    /// Total number of processed operations
+    processed_op: usize = 0,
 } = .{},
 tick_timer_ts: ?linux.kernel_timespec = null,
 next_buffer_group_id: u16 = 0,
@@ -96,16 +98,15 @@ fn processCompletions(self: *Loop) void {
                 self.tick_timer_ts = null;
                 continue;
             }
-            var op: *Op = &self.op_list.items[cqe.user_data];
-            //std.debug.print("op: {} cqe: {}\n", .{ op, cqe });
-            op.callback(op, self, cqe);
+            const op: Op = self.op_list.items[cqe.user_data];
             if (!flagMore(cqe)) {
                 // Done with operation mark it as unused.
-                // Get reference again because op_list can be reallocated during callback.
-                op = &self.op_list.items[cqe.user_data];
-                op.* = .{};
+                self.op_list.items[cqe.user_data] = .{};
                 self.metric.active_op -= 1;
             }
+            //std.debug.print("op: {} cqe: {}\n", .{ op, cqe });
+            op.callback(op, cqe);
+            self.metric.processed_op +%= 1;
         }
         ring.cq_advance(@intCast(cqes.len));
         if (cqes.len == ready) break;
@@ -203,7 +204,7 @@ fn getOp(self: *Loop) error{OutOfMemory}!struct { *Op, usize } {
 fn prepareOp(
     self: *Loop,
     ptr: *anyopaque,
-    callback: *const fn (*Op, *Loop, linux.io_uring_cqe) void,
+    callback: *const fn (Op, linux.io_uring_cqe) void,
 ) error{OutOfMemory}!usize {
     const op, const idx = try self.getOp();
     self.metric.active_op += 1;
@@ -225,7 +226,7 @@ pub fn socket(
     comptime onComplete: fn (@TypeOf(context), SyscallError!linux.fd_t) void,
 ) PrepareError!usize {
     const wrap = struct {
-        fn callback(op: *Op, _: *Loop, cqe: linux.io_uring_cqe) void {
+        fn callback(op: Op, cqe: linux.io_uring_cqe) void {
             onComplete(
                 @alignCast(@ptrCast(op.ptr orelse return)),
                 if (success(cqe)) @intCast(cqe.res) else |err| err,
@@ -253,7 +254,7 @@ pub fn listen(
     comptime onComplete: fn (@TypeOf(context), SyscallError!void) void,
 ) PrepareError!usize {
     const wrap = struct {
-        fn callback(op: *Op, _: *Loop, cqe: linux.io_uring_cqe) void {
+        fn callback(op: Op, cqe: linux.io_uring_cqe) void {
             onComplete(
                 @alignCast(@ptrCast(op.ptr orelse return)),
                 if (success(cqe)) {} else |err| err,
@@ -307,7 +308,7 @@ pub fn connect(
     comptime onComplete: fn (@TypeOf(context), SyscallError!void) void,
 ) PrepareError!usize {
     const wrap = struct {
-        fn callback(op: *Op, _: *Loop, cqe: linux.io_uring_cqe) void {
+        fn callback(op: Op, cqe: linux.io_uring_cqe) void {
             onComplete(
                 @alignCast(@ptrCast(op.ptr orelse return)),
                 if (success(cqe)) {} else |err| err,
@@ -335,7 +336,7 @@ pub fn accept(
     comptime onComplete: fn (@TypeOf(context), SyscallError!linux.fd_t) void,
 ) PrepareError!usize {
     const wrap = struct {
-        fn callback(op: *Op, _: *Loop, cqe: linux.io_uring_cqe) void {
+        fn callback(op: Op, cqe: linux.io_uring_cqe) void {
             onComplete(
                 @alignCast(@ptrCast(op.ptr orelse return)),
                 if (success(cqe)) @intCast(cqe.res) else |err| err,
@@ -364,7 +365,7 @@ pub fn recv(
     comptime onComplete: fn (@TypeOf(context), SyscallError!u32) void,
 ) PrepareError!usize {
     const wrap = struct {
-        fn callback(op: *Op, _: *Loop, cqe: linux.io_uring_cqe) void {
+        fn callback(op: Op, cqe: linux.io_uring_cqe) void {
             onComplete(
                 @alignCast(@ptrCast(op.ptr orelse return)),
                 if (success(cqe)) @intCast(cqe.res) else |err| err,
@@ -394,7 +395,7 @@ pub fn send(
     comptime onComplete: fn (@TypeOf(context), SyscallError!u32) void,
 ) PrepareError!usize {
     const wrap = struct {
-        fn callback(op: *Op, _: *Loop, cqe: linux.io_uring_cqe) void {
+        fn callback(op: Op, cqe: linux.io_uring_cqe) void {
             onComplete(
                 @alignCast(@ptrCast(op.ptr orelse return)),
                 if (success(cqe)) @intCast(cqe.res) else |err| err,
