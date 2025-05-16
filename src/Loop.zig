@@ -48,6 +48,7 @@ ring: linux.IoUring,
 op_list: std.ArrayList(Op),
 next_op_idx: usize = 0,
 metric: struct {
+    /// Number of in kernel operations
     active_op: usize = 0,
 } = .{},
 tick_timer_ts: ?linux.kernel_timespec = null,
@@ -459,13 +460,12 @@ fn tickTimer(self: *Loop, ts: *linux.kernel_timespec) SubmitError!void {
 
 pub fn initBufferGroup(
     self: *Loop,
-    allocator: std.mem.Allocator,
     buffer_size: u32,
     buffers_count: u16,
 ) !linux.IoUring.BufferGroup {
     const bg = try linux.IoUring.BufferGroup.init(
         &self.ring,
-        allocator,
+        self.allocator,
         self.next_buffer_group_id,
         buffer_size,
         buffers_count,
@@ -475,11 +475,9 @@ pub fn initBufferGroup(
 }
 
 test "socket" {
-    var ops: [1]Op = undefined;
-    var loop = try Loop.init(.{
+    var loop = try Loop.init(testing.allocator, .{
         .entries = 1,
         .fd_nr = 2,
-        .op_list = &ops,
     });
     defer loop.deinit();
 
@@ -489,7 +487,7 @@ test "socket" {
         err: ?anyerror = null,
         fd: ?linux.fd_t = null,
 
-        fn onSocket(self: *Self, err_fd: anyerror!linux.fd_t) anyerror!void {
+        fn onSocket(self: *Self, err_fd: anyerror!linux.fd_t) void {
             self.call_count += 1;
             self.err = null;
             self.fd = err_fd catch |err| brk: {
@@ -538,56 +536,10 @@ test "socket" {
     }
 }
 
-test "error in callback, should not advance cq ring" {
-    var ops: [1]Op = undefined;
-    var loop = try Loop.init(.{
-        .entries = 1,
-        .fd_nr = 2,
-        .op_list = &ops,
-    });
-    defer loop.deinit();
-
-    const Ctx = struct {
-        const Self = @This();
-        call_count: usize = 0,
-        err: ?anyerror = null,
-        fd: ?linux.fd_t = null,
-
-        fn onSocket(self: *Self, err_fd: anyerror!linux.fd_t) anyerror!void {
-            _ = try err_fd;
-            self.call_count += 1;
-            return error.OnSocketTestError;
-        }
-    };
-    var ctx: Ctx = .{};
-    const domain = linux.AF.INET;
-    const socket_type = linux.SOCK.STREAM;
-
-    { // error in callback handler, cqe will be retried
-        const op = try loop.socket(domain, socket_type, &ctx, Ctx.onSocket);
-        try testing.expectEqual(1, loop.metric.active_op);
-        try testing.expectEqual(0, loop.ring.cq_ready());
-        try testing.expectError(error.OnSocketTestError, loop.tickNr(1));
-        try testing.expectEqual(1, loop.ring.cq_ready());
-        try testing.expectEqual(1, ctx.call_count);
-        try loop.detach(op, &ctx);
-    }
-    { // retrying cqe, now succeeds
-        try testing.expectEqual(1, loop.ring.cq_ready());
-        try testing.expectEqual(1, loop.metric.active_op);
-        try loop.tickNr(0);
-        try testing.expectEqual(0, loop.metric.active_op);
-        try testing.expectEqual(0, loop.ring.cq_ready());
-        try testing.expectEqual(1, ctx.call_count);
-    }
-}
-
 test "ensure unused sqes pushes sqes to the kernel" {
-    var ops: [3]Op = undefined;
-    var loop = try Loop.init(.{
+    var loop = try Loop.init(testing.allocator, .{
         .entries = 2,
         .fd_nr = 2,
-        .op_list = &ops,
     });
     defer loop.deinit();
 
@@ -597,9 +549,9 @@ test "ensure unused sqes pushes sqes to the kernel" {
         err: ?anyerror = null,
         fd: ?linux.fd_t = null,
 
-        fn onSocket(self: *Self, err_fd: anyerror!linux.fd_t) anyerror!void {
+        fn onSocket(self: *Self, err_fd: anyerror!linux.fd_t) void {
             _ = self;
-            _ = try err_fd;
+            _ = err_fd catch unreachable;
         }
     };
     var ctx: Ctx = .{};
@@ -614,13 +566,16 @@ test "ensure unused sqes pushes sqes to the kernel" {
 }
 
 test "OutOfMemory on operations list unable to grow" {
-    var ops: [16]Op = undefined;
-    var loop = try Loop.init(.{
+    const ops_count = 8;
+    var buf: [ops_count * @sizeOf(Op)]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    var loop = try Loop.init(fba.allocator(), .{
         .entries = 2,
-        .fd_nr = 2,
-        .op_list = &ops,
+        .fd_nr = ops_count,
     });
     defer loop.deinit();
+    // fixed buffer allocator is full
+    try testing.expectEqual(buf.len, fba.end_index);
 
     const Ctx = struct {
         const Self = @This();
@@ -628,9 +583,9 @@ test "OutOfMemory on operations list unable to grow" {
         err: ?anyerror = null,
         fd: ?linux.fd_t = null,
 
-        fn onSocket(self: *Self, err_fd: anyerror!linux.fd_t) anyerror!void {
+        fn onSocket(self: *Self, err_fd: anyerror!linux.fd_t) void {
             _ = self;
-            _ = try err_fd;
+            _ = err_fd catch unreachable;
         }
     };
 
@@ -638,22 +593,22 @@ test "OutOfMemory on operations list unable to grow" {
     const domain = linux.AF.INET;
     const socket_type = linux.SOCK.STREAM;
 
-    for (0..16) |_| {
+    try testing.expectEqual(ops_count, loop.op_list.capacity);
+    for (0..ops_count) |_| {
         _ = try loop.socket(domain, socket_type, &ctx, Ctx.onSocket);
     }
+    try testing.expectEqual(ops_count, loop.op_list.items.len);
     _ = loop.socket(domain, socket_type, &ctx, Ctx.onSocket) catch |err| switch (err) {
-        error.NoOperationsAvailable => return,
+        error.OutOfMemory => return,
         else => unreachable,
     };
     unreachable;
 }
 
 test "listen (linked request) should return meaningful error" {
-    var ops: [1]Op = undefined;
-    var loop = try Loop.init(.{
+    var loop = try Loop.init(testing.allocator, .{
         .entries = 4,
         .fd_nr = 2,
-        .op_list = &ops,
     });
     defer loop.deinit();
 
@@ -661,7 +616,7 @@ test "listen (linked request) should return meaningful error" {
         const Self = @This();
         err: ?anyerror = null,
 
-        fn onListen(self: *Self, _err: anyerror!void) anyerror!void {
+        fn onListen(self: *Self, _err: anyerror!void) void {
             _ = _err catch |e| {
                 self.err = e;
             };
@@ -677,13 +632,9 @@ test "listen (linked request) should return meaningful error" {
 }
 
 test "tcp server" {
-    // echo -n one | nc -w0 localhost 9898 && echo -n two | nc -w0 localhost 9898 && echo -n three | nc -w0 localhost 9898 && echo -n four | nc -w0 localhost 9898
-
-    var ops: [2]Op = undefined;
-    var loop = try Loop.init(.{
+    var loop = try Loop.init(testing.allocator, .{
         .entries = 16,
         .fd_nr = 2,
-        .op_list = &ops,
     });
     defer loop.deinit();
 
@@ -701,30 +652,36 @@ test "tcp server" {
             _ = try self.loop.socket(self.addr.any.family, linux.SOCK.STREAM, self, onSocket);
         }
 
-        fn onSocket(self: *Self, err_fd: anyerror!linux.fd_t) anyerror!void {
-            const fd = try err_fd;
+        fn onSocket(self: *Self, err_fd: anyerror!linux.fd_t) void {
+            const fd = err_fd catch unreachable;
             self.listen_fd = fd;
-            _ = try self.loop.listen(fd, &self.addr, .{ .reuse_address = true }, self, onListen);
+            _ = self.loop.listen(
+                fd,
+                &self.addr,
+                .{ .reuse_address = true },
+                self,
+                onListen,
+            ) catch unreachable;
         }
 
-        fn onListen(self: *Self, maybe_err: anyerror!void) anyerror!void {
-            _ = try maybe_err;
-            _ = try self.loop.accept(self.listen_fd.?, self, onAccept);
+        fn onListen(self: *Self, maybe_err: anyerror!void) void {
+            _ = maybe_err catch unreachable;
+            _ = self.loop.accept(self.listen_fd.?, self, onAccept) catch unreachable;
         }
 
-        fn onAccept(self: *Self, err_fd: anyerror!linux.fd_t) anyerror!void {
-            const fd = try err_fd;
+        fn onAccept(self: *Self, err_fd: anyerror!linux.fd_t) void {
+            const fd = err_fd catch unreachable;
             self.conn_fd = fd;
-            _ = try self.loop.recv(fd, self.buffer[self.buffer_pos..], self, onRecv);
+            _ = self.loop.recv(fd, self.buffer[self.buffer_pos..], self, onRecv) catch unreachable;
         }
 
-        fn onRecv(self: *Self, err_n: anyerror!u32) anyerror!void {
-            const n = try err_n;
+        fn onRecv(self: *Self, err_n: anyerror!u32) void {
+            const n = err_n catch unreachable;
             self.conn_count += 1;
             self.buffer_pos += n;
-            try self.loop.close(self.conn_fd.?);
+            self.loop.close(self.conn_fd.?) catch unreachable;
             self.conn_fd = null;
-            _ = try self.loop.accept(self.listen_fd.?, self, onAccept);
+            _ = self.loop.accept(self.listen_fd.?, self, onAccept) catch unreachable;
         }
     };
 
@@ -759,47 +716,4 @@ fn testSend(addr: std.net.Address) void {
 
 test "size" {
     try testing.expectEqual(16, @sizeOf(Op));
-}
-
-test "moze li to ovako" {
-    const E = union(enum) {
-        success: u32,
-        close: anyerror,
-        interrupt: anyerror,
-        unknown: usize,
-    };
-    //const e: E = .{ .success = 12 };
-    const e: E = .{ .close = error.ConnectionClosed };
-
-    switch (e) {
-        .success => |n| std.debug.print("n={}\n", .{n}),
-        .close => |err| std.debug.print("reject with {}\n", .{err}),
-        else => |err| std.debug.print("reject with {}\n", .{err}),
-    }
-}
-
-test "ili mozda ovako" {
-    const E = union(enum) {
-        resolve: u32,
-        reject: struct {
-            kind: enum {
-                close,
-                interrupt,
-            },
-            err: anyerror,
-        },
-    };
-
-    //const e: E = .{ .resolve = 122 };
-    const e: E = .{ .reject = .{ .err = error.Pero, .kind = .close } };
-    switch (e) {
-        .resolve => |n| std.debug.print("resolve with n={}\n", .{n}),
-        .reject => |r| {
-            std.debug.print("reject with error {}\n", .{r.err});
-            switch (r.kind) {
-                .close => std.debug.print("je stvarno je bio close\n", .{}),
-                else => {},
-            }
-        },
-    }
 }
