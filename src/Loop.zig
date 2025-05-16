@@ -296,7 +296,7 @@ pub fn listen(
 /// General syscall errors:
 ///   error.OperationCanceled
 ///   error.InterruptedSystemCall
-/// Connect spevific syscall errors to handle:
+/// Connect specific syscall errors to handle:
 /// ref: https://man7.org/linux/man-pages/man2/connect.2.html
 /// Network errors
 ///   error.ConnectionRefused, // ECONNREFUSED
@@ -424,9 +424,18 @@ pub fn send(
 
 pub fn close(self: *Loop, fd: linux.fd_t) SubmitError!void {
     if (fd < 0) return;
+    try self.ensureSubmissionQueueCapacity(2);
+
+    // close socket
     try self.ensureSubmissionQueueCapacity(1);
     var sqe = self.ring.close_direct(no_user_data, @intCast(fd)) catch unreachable;
     sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
+    // cancel any fd operations
+    sqe = self.ring.get_sqe() catch unreachable;
+    sqe.prep_cancel_fd(fd, 0);
+    sqe.flags |= linux.IOSQE_FIXED_FILE;
+    sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
+    sqe.user_data = no_user_data;
 }
 
 /// Cancel single operation by index.
@@ -480,7 +489,7 @@ test "socket" {
     var ops: [1]Op = undefined;
     var loop = try Loop.init(.{
         .entries = 1,
-        .fd_nr = 1,
+        .fd_nr = 2,
         .op_list = &ops,
     });
     defer loop.deinit();

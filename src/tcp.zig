@@ -228,3 +228,46 @@ test "sizeOf" {
     try std.testing.expectEqual(144, @sizeOf(Listener(T, "")));
     try std.testing.expectEqual(152, @sizeOf(Connector(T, "")));
 }
+
+const posix = std.posix;
+const testing = std.testing;
+
+test "operation is canceled on close" {
+    var ops: [2]io.Loop.Op = undefined;
+    var loop = try io.Loop.init(.{
+        .entries = 16,
+        .fd_nr = 2,
+        .op_list = &ops,
+    });
+    defer loop.deinit();
+
+    const Handler = struct {
+        const Self = @This();
+        conn_count: usize = 0,
+
+        tcp: io.tcp.Listener(Self, "tcp"),
+
+        pub fn onAccept(self: *Self, fd: posix.fd_t) !void {
+            self.conn_count += 1;
+            try self.tcp.loop.close(fd);
+        }
+    };
+    const addr: std.net.Address = try std.net.Address.resolveIp("127.0.0.1", 9991);
+    var handler: Handler = .{ .tcp = .init(&loop, addr) };
+    try handler.tcp.listen();
+
+    try loop.tickNr(1); // create socket
+    try loop.tickNr(1); // listen
+
+    // sync connect
+    var stream = try std.net.tcpConnectToAddress(addr);
+    defer stream.close();
+
+    try loop.tickNr(1); // accept
+    try testing.expectEqual(1, handler.conn_count);
+
+    try handler.tcp.close();
+    // there is active listen operation which will be canceled
+    try testing.expectEqual(1, loop.metric.active_op);
+    try loop.drain();
+}
