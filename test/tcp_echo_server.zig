@@ -13,12 +13,9 @@ pub fn main() !void {
     defer _ = debug_allocator.deinit();
     const gpa = debug_allocator.allocator();
 
-    var ops = try gpa.alloc(io.Loop.Op, 2);
-    defer gpa.free(ops);
-    var loop = try io.Loop.init(.{
+    var loop = try io.Loop.init(gpa, .{
         .entries = 4096,
         .fd_nr = 1024,
-        .op_list = ops,
     });
     defer loop.deinit();
 
@@ -28,24 +25,11 @@ pub fn main() !void {
         .allocator = gpa,
         .loop = &loop,
     };
-    try listener.tcp.listen();
+    listener.tcp.listen();
 
     var i: usize = 1;
     while (true) : (i +%= 1) {
-        loop.runFor(1000) catch |err| {
-            switch (err) {
-                error.NoOperationsAvailable => {
-                    log.debug("loop run {} ops.len: {}", .{ err, ops.len });
-                    ops = try gpa.realloc(ops, ops.len * 2);
-                    loop.op_list = ops;
-                },
-                // error.FileTableOverflow,
-                else => {
-                    log.err("loop run {}", .{err});
-                    return err;
-                },
-            }
-        };
+        try loop.runFor(1000);
         log.debug("run: {} bytes: {} MB: {}", .{ i, bytes, bytes / 1000_000 });
         bytes = 0;
     }
@@ -67,7 +51,12 @@ const Listener = struct {
         const conn = try self.allocator.create(Connection);
         errdefer self.allocator.destroy(conn);
         conn.* = .init(self, fd);
-        try conn.recv();
+        conn.recv();
+    }
+
+    pub fn onError(self: *Self, err: anyerror) void {
+        log.err("listener {}", .{err});
+        self.tcp.listen();
     }
 
     fn destroy(self: *Self, conn: *Connection) void {
@@ -92,27 +81,27 @@ const Connection = struct {
         };
     }
 
-    fn recv(self: *Self) !void {
-        try self.tcp.recv(&self.buffer);
+    fn recv(self: *Self) void {
+        self.tcp.recv(&self.buffer);
     }
 
     pub fn onRecv(self: *Self, n: u32) !void {
         bytes += n;
         self.head = 0;
         self.tail = n;
-        try self.tcp.send(self.buffer[self.head..self.tail]);
+        self.tcp.send(self.buffer[self.head..self.tail]);
     }
 
     pub fn onSend(self: *Self, n: u32) !void {
         self.head += n;
         if (self.head == self.tail) {
-            try self.recv();
+            self.recv();
         } else {
-            try self.tcp.send(self.buffer[self.head..self.tail]);
+            self.tcp.send(self.buffer[self.head..self.tail]);
         }
     }
 
-    pub fn onClose(self: *Self) !void {
+    pub fn onClose(self: *Self, _: anyerror) void {
         self.parent.destroy(self);
     }
 };

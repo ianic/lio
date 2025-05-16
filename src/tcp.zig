@@ -23,50 +23,72 @@ pub fn Connector(comptime Parent: type, comptime parent_field_name: []const u8) 
             return .{ .loop = loop, .addr = addr };
         }
 
-        pub fn connect(self: *Self) !void {
-            if (self.fd >= 0) try self.close();
-            try self.socketSubmit();
-        }
-
-        fn socketSubmit(self: *Self) !void {
+        pub fn connect(self: *Self) void {
             assert(self.fd < 0);
-            self.op = try self.loop.socket(self.addr.any.family, linux.SOCK.STREAM, self, socketComplete);
+            self.socketSubmit();
         }
 
-        fn socketComplete(self: *Self, res: io.SyscallError!linux.fd_t) anyerror!void {
+        fn socketSubmit(self: *Self) void {
+            assert(self.fd < 0);
+            self.op = self.loop.socket(self.addr.any.family, linux.SOCK.STREAM, self, socketComplete) catch |err| {
+                return self.handleError(err);
+            };
+        }
+
+        fn socketComplete(self: *Self, res: io.SyscallError!linux.fd_t) void {
             if (res) |fd| {
                 self.fd = fd;
-                self.op = try self.loop.connect(fd, &self.addr, &self.connect_timeout, self, connectComplete);
+                self.op = self.loop.connect(fd, &self.addr, &self.connect_timeout, self, connectComplete) catch |err| {
+                    return self.handleError(err);
+                };
             } else |err| switch (err) {
-                error.InterruptedSystemCall => try self.socketSubmit(),
-                else => return err,
+                error.InterruptedSystemCall => self.socketSubmit(),
+                else => self.handleError(err),
             }
         }
 
-        fn connectComplete(self: *Self, res: io.SyscallError!void) anyerror!void {
+        fn connectComplete(self: *Self, res: io.SyscallError!void) void {
             if (res) {
-                try self.parent().onConnect(self.fd);
-                self.fd = -2;
-            } else |err| switch (err) {
-                error.OperationCanceled, // connect timeout
-                error.InterruptedSystemCall,
-                // Network errors
-                error.ConnectionRefused, // ECONNREFUSED
-                error.NetworkIsUnreachable, // ENETUNREACH
-                error.NoRouteToHost, // EHOSTUNREACH
-                error.ConnectionTimedOut, // ETIMEDOUT
-                error.ConnectionResetByPeer, // ECONNRESET
-                => try self.connect(),
-                else => return err,
+                self.parent().onConnect(self.fd) catch |err| return self.handleError(err);
+                self.fd = -2; // fd ownership transferred to the connection
+            } else |err| {
+                self.handleError(err);
             }
+        }
+
+        fn handleError(self: *Self, err: anyerror) void {
+            self.close() catch |e| {
+                log.err("connector close {}", .{e});
+                self.fd = -1;
+            };
+            self.parent().onError(err);
         }
 
         pub fn close(self: *Self) !void {
             if (self.fd < 0) return;
+            try self.loop.detach(self.op, self);
             try self.loop.close(self.fd);
             self.fd = -1;
-            try self.loop.detachOp(self.op, self);
         }
+    };
+}
+
+/// Application can retry on network error
+pub fn isNetworkError(err: anyerror) bool {
+    return switch (err) {
+        error.InterruptedSystemCall,
+        error.OperationCanceled, // Connect timeout
+        // TCP Connection read/write errors
+        error.EndOfFile, // Clean connection close on read
+        error.BrokenPipe,
+        error.ConnectionResetByPeer, // ECONNRESET
+        // Connect Network errors
+        error.ConnectionRefused, // ECONNREFUSED
+        error.NetworkIsUnreachable, // ENETUNREACH
+        error.NoRouteToHost, // EHOSTUNREACH
+        error.ConnectionTimedOut, // ETIMEDOUT
+        => true,
+        else => false,
     };
 }
 
@@ -88,72 +110,81 @@ pub fn Listener(comptime Parent: type, comptime parent_field_name: []const u8) t
             return .{ .loop = loop, .addr = addr };
         }
 
-        pub fn listen(self: *Self) !void {
+        pub fn listen(self: *Self) void {
             assert(self.fd == -1);
-            try self.socketSubmit();
+            self.socketSubmit();
         }
 
-        fn socketSubmit(self: *Self) !void {
+        fn socketSubmit(self: *Self) void {
             assert(self.fd < 0);
-            self.op = try self.loop.socket(self.addr.any.family, linux.SOCK.STREAM, self, socketComplete);
+            self.op = self.loop.socket(
+                self.addr.any.family,
+                linux.SOCK.STREAM,
+                self,
+                socketComplete,
+            ) catch |err| {
+                return self.handleError(err);
+            };
         }
 
-        fn socketComplete(self: *Self, res: io.SyscallError!linux.fd_t) anyerror!void {
+        fn socketComplete(self: *Self, res: io.SyscallError!linux.fd_t) void {
             if (res) |fd| {
                 self.fd = fd;
-                self.op = try self.loop.listen(fd, &self.addr, self.listen_options, self, listenComplete);
+                self.op = self.loop.listen(
+                    fd,
+                    &self.addr,
+                    self.listen_options,
+                    self,
+                    listenComplete,
+                ) catch |err| {
+                    return self.handleError(err);
+                };
             } else |err| switch (err) {
-                error.InterruptedSystemCall => try self.socketSubmit(),
-                else => return err,
+                error.InterruptedSystemCall => self.socketSubmit(),
+                else => return self.handleError(err),
             }
         }
 
-        fn listenComplete(self: *Self, res: io.SyscallError!void) anyerror!void {
+        fn listenComplete(self: *Self, res: io.SyscallError!void) void {
             if (res)
-                try self.acceptSubmit()
-            else |err| {
-                switch (err) {
-                    error.InterruptedSystemCall => {},
-                    error.AddressAlreadyInUse => {
-                        log.err("listen {} {}", .{ self.addr, err });
-                    },
-                    else => return err,
-                }
-                try self.close();
-                try self.socketSubmit();
+                self.acceptSubmit()
+            else |err| switch (err) {
+                error.InterruptedSystemCall => self.socketSubmit(),
+                else => return self.handleError(err),
             }
         }
 
-        fn acceptSubmit(self: *Self) !void {
-            self.op = try self.loop.accept(self.fd, self, acceptComplete);
+        fn acceptSubmit(self: *Self) void {
+            self.op = self.loop.accept(self.fd, self, acceptComplete) catch |err| {
+                return self.handleError(err);
+            };
         }
 
-        fn acceptComplete(self: *Self, res: io.SyscallError!linux.fd_t) anyerror!void {
+        fn acceptComplete(self: *Self, res: io.SyscallError!linux.fd_t) void {
             if (res) |fd|
                 self.parent().onAccept(fd) catch |err| {
-                    log.err("accept resolve {}", .{err});
-                    self.loop.close(fd) catch {};
+                    return self.handleError(err);
                 }
             else |err| switch (err) {
                 error.InterruptedSystemCall => {},
-                error.SoftwareCausedConnectionAbort, // ECONNABORTED
-                error.NoBufferSpaceAvailable, // ENOBUFS
-                // No more fixed file descriptors, this connection if not
-                // accepted but we can continue working.
-                error.FileTableOverflow,
-                => {
-                    log.warn("accept {} {}", .{ self.addr, err });
-                },
-                else => return err,
+                else => return self.handleError(err),
             }
-            try self.acceptSubmit();
+            self.acceptSubmit();
+        }
+
+        fn handleError(self: *Self, err: anyerror) void {
+            self.close() catch |e| {
+                log.err("connector close {}", .{e});
+                self.fd = -1;
+            };
+            self.parent().onError(err);
         }
 
         pub fn close(self: *Self) !void {
             if (self.fd < 0) return;
-            _ = try self.loop.close(self.fd);
+            try self.loop.detach(self.op, self);
+            try self.loop.close(self.fd);
             self.fd = -1;
-            try self.loop.detachOp(self.op, self);
         }
     };
 }
@@ -178,47 +209,61 @@ pub fn Connection(comptime Parent: type, comptime parent_field_name: []const u8)
             return .{ .loop = loop, .fd = fd };
         }
 
-        pub fn send(self: *Self, buffer: []const u8) !void {
+        pub fn send(self: *Self, buffer: []const u8) void {
+            self.ops[0] = self.loop.send(self.fd, buffer, self, sendComplete) catch |err| {
+                return self.handleError(err);
+            };
             self.send_buffer = buffer;
-            self.ops[0] = try self.loop.send(self.fd, buffer, self, sendComplete);
         }
 
-        fn sendComplete(self: *Self, res: io.SyscallError!u32) anyerror!void {
+        fn sendComplete(self: *Self, res: io.SyscallError!u32) void {
             if (res) |n| {
                 self.send_buffer = &.{};
-                try self.parent().onSend(n);
+                self.parent().onSend(n) catch |err| {
+                    return self.handleError(err);
+                };
             } else |err| switch (err) {
-                error.BrokenPipe,
-                error.ConnectionResetByPeer,
-                => try self.close(),
-                error.InterruptedSystemCall => try self.send(self.send_buffer),
+                error.InterruptedSystemCall => self.send(self.send_buffer),
                 error.OperationCanceled => unreachable,
-                else => return err,
+                else => self.handleError(err),
             }
         }
 
-        pub fn recv(self: *Self, buffer: []u8) !void {
+        pub fn recv(self: *Self, buffer: []u8) void {
+            self.ops[1] = self.loop.recv(self.fd, buffer, self, recvComplete) catch |err| {
+                return self.handleError(err);
+            };
             self.recv_buffer = buffer;
-            self.ops[1] = try self.loop.recv(self.fd, buffer, self, recvComplete);
         }
 
-        fn recvComplete(self: *Self, res: io.SyscallError!u32) anyerror!void {
+        fn recvComplete(self: *Self, res: io.SyscallError!u32) void {
             if (res) |n| {
                 self.recv_buffer = &.{};
-                if (n == 0) return try self.close();
-                try self.parent().onRecv(n);
+                if (n == 0) return self.handleError(error.EndOfFile); // clean close
+                self.parent().onRecv(n) catch |err| {
+                    return self.handleError(err);
+                };
             } else |err| switch (err) {
-                error.ConnectionResetByPeer => try self.close(),
-                error.InterruptedSystemCall => try self.recv(self.recv_buffer),
+                error.InterruptedSystemCall => self.recv(self.recv_buffer),
                 error.OperationCanceled => unreachable,
-                else => return err,
+                else => self.handleError(err),
             }
         }
 
-        fn close(self: *Self) !void {
+        fn handleError(self: *Self, err: anyerror) void {
+            self.close() catch |e| {
+                log.err("tcp close {}", .{e});
+                self.fd = -1;
+            };
+            self.parent().onClose(err);
+        }
+
+        pub fn close(self: *Self) !void {
+            if (self.fd < 0) return;
+            // TODO: ovo ne vraca error
+            for (self.ops) |op| try self.loop.detach(op, self);
             try self.loop.close(self.fd);
-            for (self.ops) |op| try self.loop.detachOp(op, self);
-            try self.parent().onClose();
+            self.fd = -1;
         }
     };
 }
@@ -233,11 +278,9 @@ const posix = std.posix;
 const testing = std.testing;
 
 test "operation is canceled on close" {
-    var ops: [2]io.Loop.Op = undefined;
-    var loop = try io.Loop.init(.{
+    var loop = try io.Loop.init(testing.allocator, .{
         .entries = 16,
         .fd_nr = 2,
-        .op_list = &ops,
     });
     defer loop.deinit();
 
@@ -251,10 +294,14 @@ test "operation is canceled on close" {
             self.conn_count += 1;
             try self.tcp.loop.close(fd);
         }
+
+        pub fn onError(_: *Self, _: anyerror) void {
+            unreachable;
+        }
     };
     const addr: std.net.Address = try std.net.Address.resolveIp("127.0.0.1", 9991);
     var handler: Handler = .{ .tcp = .init(&loop, addr) };
-    try handler.tcp.listen();
+    handler.tcp.listen();
 
     try loop.tickNr(1); // create socket
     try loop.tickNr(1); // listen

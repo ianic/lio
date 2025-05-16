@@ -2,6 +2,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 const testing = std.testing;
+const mem = std.mem;
 
 const SyscallError = @import("errno.zig").Error;
 
@@ -19,17 +20,14 @@ pub const Options = struct {
     flags: u32 = linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_SQPOLL,
     /// Number of kernel registered file descriptors
     fd_nr: u16,
-    /// Provided pool operations pool.
-    /// Operation is submitted but not jet completed task; in kernel task.
-    op_list: []Op,
 };
 
 pub const Op = struct {
     ptr: ?*anyopaque = null,
-    callback: *const fn (*Op, *Loop, linux.io_uring_cqe) anyerror!void = noopCallback,
+    callback: *const fn (*Op, *Loop, linux.io_uring_cqe) void = noopCallback,
 
     const noopCallback = struct {
-        fn noop(_: *Op, _: *Loop, _: linux.io_uring_cqe) anyerror!void {}
+        fn noop(_: *Op, _: *Loop, _: linux.io_uring_cqe) void {}
     }.noop;
 
     /// Replace callback with noop callback. Enables ptr to be destroyed.
@@ -40,14 +38,14 @@ pub const Op = struct {
 };
 
 const Loop = @This();
-
 const yes_value: u32 = 1;
 const yes_socket_option = std.mem.asBytes(&yes_value);
 const no_user_data: u64 = std.math.maxInt(u64);
 const timer_user_data: u64 = no_user_data - 1;
 
+allocator: mem.Allocator,
 ring: linux.IoUring,
-op_list: []Op,
+op_list: std.ArrayList(Op),
 next_op_idx: usize = 0,
 metric: struct {
     active_op: usize = 0,
@@ -55,73 +53,62 @@ metric: struct {
 tick_timer_ts: ?linux.kernel_timespec = null,
 next_buffer_group_id: u16 = 0,
 
-pub fn init(opt: Options) !Loop {
+pub fn init(allocator: mem.Allocator, opt: Options) !Loop {
     var ring = try linux.IoUring.init(opt.entries, opt.flags);
     errdefer ring.deinit();
     try ring.register_files_sparse(opt.fd_nr);
-    for (opt.op_list) |*op| op.* = .{};
     return .{
+        .allocator = allocator,
         .ring = ring,
-        .op_list = opt.op_list,
+        .op_list = try .initCapacity(allocator, @min(16, opt.fd_nr)),
     };
 }
 
 pub fn deinit(self: *Loop) void {
+    self.op_list.deinit();
     self.ring.deinit();
 }
 
 pub fn tickNr(self: *Loop, wait_nr: u32) !void {
     _ = try self.ring.submit_and_wait(wait_nr);
-    try self.processCompletions();
-}
-
-fn processCompletions(self: *Loop) !void {
-    if (try self.processReadyCompletions()) _ = try self.processReadyCompletions();
+    self.processCompletions();
 }
 
 /// Get completions and call operation callback for each completion.
-/// Returns true in the case of overlapping ring.
-///
-/// In the case of the ring overlap there can be more completions at the start
-/// of the ring. In that case need to peek two times first to get those from the
-/// end of the cqes list and then to get those from the start of the list.
-fn processReadyCompletions(self: *Loop) !bool {
-    // peek list of ready cqes
+fn processCompletions(self: *Loop) void {
     var ring = &self.ring;
-    const ready = ring.cq_ready();
-    if (ready == 0) return false;
-    const head = ring.cq.head.* & ring.cq.mask;
-    const tail = @min(ring.cq.cqes.len - head, ready);
-    const cqes = ring.cq.cqes[head..][0..tail];
-
-    // number of completed cqe's in this run
-    var completed: u32 = 0;
-    defer ring.cq_advance(completed);
-
-    for (cqes) |cqe| {
-        if (cqe.user_data == no_user_data) {
-            // cqe without Op in userdata
-            completed += 1;
-            continue;
+    // Repeat in the case of overlapping ring
+    while (true) {
+        const ready = ring.cq_ready();
+        if (ready == 0) break;
+        // Peek list of ready cqes
+        const head = ring.cq.head.* & ring.cq.mask;
+        const tail = @min(ring.cq.cqes.len - head, ready);
+        const cqes = ring.cq.cqes[head..][0..tail];
+        // Call callback of each completion
+        for (cqes) |cqe| {
+            if (cqe.user_data == no_user_data) {
+                // cqe without Op in userdata
+                continue;
+            }
+            if (cqe.user_data == timer_user_data) {
+                self.tick_timer_ts = null;
+                continue;
+            }
+            var op: *Op = &self.op_list.items[cqe.user_data];
+            //std.debug.print("op: {} cqe: {}\n", .{ op, cqe });
+            op.callback(op, self, cqe);
+            if (!flagMore(cqe)) {
+                // Done with operation mark it as unused.
+                // Get reference again because op_list can be reallocated during callback.
+                op = &self.op_list.items[cqe.user_data];
+                op.* = .{};
+                self.metric.active_op -= 1;
+            }
         }
-        if (cqe.user_data == timer_user_data) {
-            self.tick_timer_ts = null;
-            completed += 1;
-            continue;
-        }
-        var op: *Op = &self.op_list[cqe.user_data];
-        //std.debug.print("op: {} cqe: {}\n", .{ op, cqe });
-        try op.callback(op, self, cqe);
-        // Only advance if not error, will try next time same cqe in the
-        // case of error.
-        completed += 1;
-        if (!flagMore(cqe)) {
-            // Done with operation mark it as unused
-            op.ptr = null;
-            self.metric.active_op -= 1;
-        }
+        ring.cq_advance(@intCast(cqes.len));
+        if (cqes.len == ready) break;
     }
-    return cqes.len < ready;
 }
 
 pub fn tick(self: *Loop) !void {
@@ -137,7 +124,7 @@ pub fn runFor(self: *Loop, ms: u64) !void {
     }
     while (self.tick_timer_ts != null) {
         _ = try self.ring.submit_and_wait(1);
-        try self.processCompletions();
+        self.processCompletions();
     }
 }
 
@@ -169,7 +156,7 @@ pub const SubmitError = error{
     Unexpected,
 };
 
-pub const PrepareError = SubmitError || error{NoOperationsAvailable};
+pub const PrepareError = SubmitError || error{OutOfMemory};
 
 fn ensureSubmissionQueueCapacity(self: *Loop, count: u32) SubmitError!void {
     assert(count <= self.ring.sq.sqes.len);
@@ -191,35 +178,35 @@ fn ensureSubmissionQueueCapacity(self: *Loop, count: u32) SubmitError!void {
 }
 
 /// Returns Op and index to that Op in op_list
-fn getOp(self: *Loop) error{NoOperationsAvailable}!struct { *Op, usize } {
-    const len = self.op_list.len;
-    // find unused op with higher index than the last one
-    for (self.next_op_idx..len) |idx| {
-        const op = &self.op_list[idx];
-        if (op.ptr == null) {
-            self.metric.active_op += 1;
-            self.next_op_idx = idx + 1;
-            return .{ op, idx };
+fn getOp(self: *Loop) error{OutOfMemory}!struct { *Op, usize } {
+    // Find existing free operation
+    {
+        const ops = self.op_list.items;
+        // find unused op with higher index than the last one
+        for (self.next_op_idx..ops.len) |idx| {
+            const op = &ops[idx];
+            if (op.ptr == null) return .{ op, idx };
+        }
+        // find unused from start of the list
+        for (0..@min(self.next_op_idx, ops.len)) |idx| {
+            const op = &ops[idx];
+            if (op.ptr == null) return .{ op, idx };
         }
     }
-    // find unused from start of the list
-    for (0..@min(self.next_op_idx, len)) |idx| {
-        const op = &self.op_list[idx];
-        if (op.ptr == null) {
-            self.metric.active_op += 1;
-            self.next_op_idx = idx + 1;
-            return .{ op, idx };
-        }
-    }
-    return error.NoOperationsAvailable;
+    // Increase operations list
+    try self.op_list.append(.{});
+    const idx = self.op_list.items.len - 1;
+    return .{ &self.op_list.items[idx], idx };
 }
 
 fn prepareOp(
     self: *Loop,
     ptr: *anyopaque,
-    callback: *const fn (*Op, *Loop, linux.io_uring_cqe) anyerror!void,
-) error{NoOperationsAvailable}!usize {
+    callback: *const fn (*Op, *Loop, linux.io_uring_cqe) void,
+) error{OutOfMemory}!usize {
     const op, const idx = try self.getOp();
+    self.metric.active_op += 1;
+    self.next_op_idx = idx + 1;
     op.* = .{
         .ptr = ptr,
         .callback = callback,
@@ -234,11 +221,11 @@ pub fn socket(
     domain: u32,
     socket_type: u32,
     context: anytype,
-    comptime onComplete: fn (@TypeOf(context), SyscallError!linux.fd_t) anyerror!void,
+    comptime onComplete: fn (@TypeOf(context), SyscallError!linux.fd_t) void,
 ) PrepareError!usize {
     const wrap = struct {
-        fn callback(op: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
-            try onComplete(
+        fn callback(op: *Op, _: *Loop, cqe: linux.io_uring_cqe) void {
+            onComplete(
                 @alignCast(@ptrCast(op.ptr orelse return)),
                 if (success(cqe)) @intCast(cqe.res) else |err| err,
             );
@@ -262,11 +249,11 @@ pub fn listen(
     addr: *std.net.Address,
     opt: std.net.Address.ListenOptions,
     context: anytype,
-    comptime onComplete: fn (@TypeOf(context), SyscallError!void) anyerror!void,
+    comptime onComplete: fn (@TypeOf(context), SyscallError!void) void,
 ) PrepareError!usize {
     const wrap = struct {
-        fn callback(op: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
-            try onComplete(
+        fn callback(op: *Op, _: *Loop, cqe: linux.io_uring_cqe) void {
+            onComplete(
                 @alignCast(@ptrCast(op.ptr orelse return)),
                 if (success(cqe)) {} else |err| err,
             );
@@ -316,11 +303,11 @@ pub fn connect(
     addr: *std.net.Address,
     timeout: ?*linux.kernel_timespec,
     context: anytype,
-    comptime onComplete: fn (@TypeOf(context), SyscallError!void) anyerror!void,
+    comptime onComplete: fn (@TypeOf(context), SyscallError!void) void,
 ) PrepareError!usize {
     const wrap = struct {
-        fn callback(op: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
-            try onComplete(
+        fn callback(op: *Op, _: *Loop, cqe: linux.io_uring_cqe) void {
+            onComplete(
                 @alignCast(@ptrCast(op.ptr orelse return)),
                 if (success(cqe)) {} else |err| err,
             );
@@ -344,11 +331,11 @@ pub fn accept(
     self: *Loop,
     fd: linux.fd_t,
     context: anytype,
-    comptime onComplete: fn (@TypeOf(context), SyscallError!linux.fd_t) anyerror!void,
+    comptime onComplete: fn (@TypeOf(context), SyscallError!linux.fd_t) void,
 ) PrepareError!usize {
     const wrap = struct {
-        fn callback(op: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
-            try onComplete(
+        fn callback(op: *Op, _: *Loop, cqe: linux.io_uring_cqe) void {
+            onComplete(
                 @alignCast(@ptrCast(op.ptr orelse return)),
                 if (success(cqe)) @intCast(cqe.res) else |err| err,
             );
@@ -364,20 +351,20 @@ pub fn accept(
 }
 
 /// Returns 0 on graceful shutdown.
-/// error.ConnectionResetByPeer when remote host sends RST packet
+///   error.ConnectionResetByPeer when remote host sends RST packet
 /// Common syscall errors to handle:
-/// error.OperationCanceled
-/// error.InterruptedSystemCall
+///   error.OperationCanceled
+///   error.InterruptedSystemCall
 pub fn recv(
     self: *Loop,
     fd: linux.fd_t,
     buffer: []u8,
     context: anytype,
-    comptime onComplete: fn (@TypeOf(context), SyscallError!u32) anyerror!void,
+    comptime onComplete: fn (@TypeOf(context), SyscallError!u32) void,
 ) PrepareError!usize {
     const wrap = struct {
-        fn callback(op: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
-            try onComplete(
+        fn callback(op: *Op, _: *Loop, cqe: linux.io_uring_cqe) void {
+            onComplete(
                 @alignCast(@ptrCast(op.ptr orelse return)),
                 if (success(cqe)) @intCast(cqe.res) else |err| err,
             );
@@ -393,21 +380,21 @@ pub fn recv(
 }
 
 /// Send on closed socket will return:
-/// error.BrokenPipe - send on closed socket
-/// error.ConnectionResetByPeer - send on forcefully closed socket (RST)
+///   error.BrokenPipe - send on closed socket
+///   error.ConnectionResetByPeer - send on forcefully closed socket (RST)
 /// Common syscall errors to handle:
-/// error.OperationCanceled
-/// error.InterruptedSystemCall
+///   error.OperationCanceled
+///   error.InterruptedSystemCall
 pub fn send(
     self: *Loop,
     fd: linux.fd_t,
     buffer: []const u8,
     context: anytype,
-    comptime onComplete: fn (@TypeOf(context), SyscallError!u32) anyerror!void,
+    comptime onComplete: fn (@TypeOf(context), SyscallError!u32) void,
 ) PrepareError!usize {
     const wrap = struct {
-        fn callback(op: *Op, _: *Loop, cqe: linux.io_uring_cqe) anyerror!void {
-            try onComplete(
+        fn callback(op: *Op, _: *Loop, cqe: linux.io_uring_cqe) void {
+            onComplete(
                 @alignCast(@ptrCast(op.ptr orelse return)),
                 if (success(cqe)) @intCast(cqe.res) else |err| err,
             );
@@ -422,6 +409,7 @@ pub fn send(
     return op_idx;
 }
 
+/// Close file descriptor and cancel any pending operations on that fd.
 pub fn close(self: *Loop, fd: linux.fd_t) SubmitError!void {
     if (fd < 0) return;
     try self.ensureSubmissionQueueCapacity(2);
@@ -445,19 +433,20 @@ pub fn cancel(self: *Loop, idx: usize) SubmitError!void {
     sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
 }
 
-/// Detach single operation by index.
-pub fn detachOp(self: *Loop, idx: usize, ctx: *anyopaque) !void {
-    if (idx >= self.op_list.len) return;
-    const op = &self.op_list[idx];
+/// Detach (don't call callback when completed) single operation by index and
+/// cancel that operation if still active.
+pub fn detach(self: *Loop, idx: usize, ctx: *anyopaque) !void {
+    if (idx >= self.op_list.items.len) return;
+    const op = &self.op_list.items[idx];
     if (op.ptr) |op_ptr| if (op_ptr == ctx) {
         op.detach(ctx);
         try self.cancel(idx);
     };
 }
 
-/// Detach all operations for some context and cancel any pending operations.
-pub fn detach(self: *Loop, ctx: *anyopaque) SubmitError!void {
-    for (self.op_list, 0..) |*op, idx| if (op.ptr) |op_ptr| if (op_ptr == ctx) {
+/// Detach all operations for some context and cancel active operations.
+pub fn detachAll(self: *Loop, ctx: *anyopaque) SubmitError!void {
+    for (self.op_list.items, 0..) |*op, idx| if (op.ptr) |op_ptr| if (op_ptr == ctx) {
         op.detach(ctx);
         try self.cancel(idx);
     };
@@ -581,7 +570,7 @@ test "error in callback, should not advance cq ring" {
         try testing.expectError(error.OnSocketTestError, loop.tickNr(1));
         try testing.expectEqual(1, loop.ring.cq_ready());
         try testing.expectEqual(1, ctx.call_count);
-        try loop.detachOp(op, &ctx);
+        try loop.detach(op, &ctx);
     }
     { // retrying cqe, now succeeds
         try testing.expectEqual(1, loop.ring.cq_ready());

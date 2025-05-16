@@ -17,11 +17,9 @@ pub fn main() !void {
     defer _ = debug_allocator.deinit();
     const gpa = debug_allocator.allocator();
 
-    var ops: [64]io.Loop.Op = undefined;
-    var loop = try io.Loop.init(.{
+    var loop = try io.Loop.init(gpa, .{
         .entries = 256,
         .fd_nr = 32,
-        .op_list = &ops,
     });
     defer loop.deinit();
 
@@ -34,7 +32,7 @@ pub fn main() !void {
     var clients: [24]Connector = undefined;
     for (&clients, 0..) |*cli, no| {
         cli.* = Connector.init(&loop, addr, no);
-        try cli.tcp.connect();
+        cli.tcp.connect();
     }
 
     while (true)
@@ -59,12 +57,15 @@ const Connector = struct {
 
     pub fn onConnect(self: *Self, fd: linux.fd_t) !void {
         self.conn = .init(self, fd);
-        try self.conn.echo();
+        self.conn.echo();
     }
 
-    fn reconnect(self: *Self) !void {
-        log.debug("{} reconnect", .{self.no});
-        try self.tcp.connect();
+    pub fn onError(self: *Self, err: anyerror) void {
+        if (io.tcp.isNetworkError(err)) {
+            log.debug("reconnect {} on {}", .{ self.no, err });
+            return self.tcp.connect();
+        }
+        log.err("connector {}", .{err});
     }
 };
 
@@ -78,6 +79,7 @@ const Connection = struct {
     send_head: u32 = 0,
     send_tail: u32 = 0,
     recv_pos: u32 = 0,
+    bytes_received: usize = 0,
 
     fn init(parent: *Connector, fd: linux.fd_t) Self {
         return .{
@@ -87,35 +89,52 @@ const Connection = struct {
     }
 
     // Start echo cycle, send random bytes and expect to receive same bytes
-    fn echo(self: *Self) !void {
+    fn echo(self: *Self) void {
+        if (self.bytes_received > 1024 * 1024 * 1024) {
+            self.tcp.close() catch unreachable;
+            //self.parent.tcp.connect();
+            self.parent.onError(error.EndOfFile);
+            return;
+        }
+
         self.recv_pos = 0;
         self.send_tail = rnd.intRangeAtMost(u32, 16, 64 * 1024);
         self.send_head = 0;
-        try self.tcp.send(buffer[self.send_head..self.send_tail]);
+        self.tcp.send(buffer[self.send_head..self.send_tail]);
     }
 
     pub fn onSend(self: *Self, n: u32) !void {
         self.send_head += n;
         if (self.send_head == self.send_tail) {
-            try self.tcp.recv(&self.buffer);
+            self.tcp.recv(&self.buffer);
         } else {
             // can't happen because we are sending with msg.waitall in Loop.send
             log.err("short send", .{});
-            try self.tcp.send(buffer[self.send_head..self.send_tail]);
+            self.tcp.send(buffer[self.send_head..self.send_tail]);
         }
     }
 
     pub fn onRecv(self: *Self, n: u32) !void {
         assert(std.mem.eql(u8, self.buffer[0..n], buffer[self.recv_pos..][0..n]));
         self.recv_pos += n;
+        self.bytes_received += n;
         if (self.recv_pos == self.send_tail) {
-            try self.echo();
+            self.echo();
         } else {
-            try self.tcp.recv(&self.buffer);
+            self.tcp.recv(&self.buffer);
         }
     }
 
-    pub fn onClose(self: *Self) !void {
-        try self.parent.reconnect();
+    pub fn onClose(self: *Self, err: anyerror) void {
+        switch (err) {
+            error.EndOfFile => {},
+            error.BrokenPipe, error.ConnectionResetByPeer => {
+                log.debug("connection close {}", .{err});
+            },
+            else => {
+                log.err("connection close {}", .{err});
+            },
+        }
+        self.parent.onError(err);
     }
 };
