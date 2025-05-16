@@ -25,11 +25,6 @@ pub fn Connector(comptime Parent: type, comptime parent_field_name: []const u8) 
 
         pub fn connect(self: *Self) void {
             assert(self.fd < 0);
-            self.socketSubmit();
-        }
-
-        fn socketSubmit(self: *Self) void {
-            assert(self.fd < 0);
             self.op = self.loop.socket(self.addr.any.family, linux.SOCK.STREAM, self, socketComplete) catch |err| {
                 return self.handleError(err);
             };
@@ -42,7 +37,7 @@ pub fn Connector(comptime Parent: type, comptime parent_field_name: []const u8) 
                     return self.handleError(err);
                 };
             } else |err| switch (err) {
-                error.InterruptedSystemCall => self.socketSubmit(),
+                error.InterruptedSystemCall => self.connect(),
                 else => self.handleError(err),
             }
         }
@@ -111,11 +106,6 @@ pub fn Listener(comptime Parent: type, comptime parent_field_name: []const u8) t
         }
 
         pub fn listen(self: *Self) void {
-            assert(self.fd == -1);
-            self.socketSubmit();
-        }
-
-        fn socketSubmit(self: *Self) void {
             assert(self.fd < 0);
             self.op = self.loop.socket(
                 self.addr.any.family,
@@ -140,21 +130,21 @@ pub fn Listener(comptime Parent: type, comptime parent_field_name: []const u8) t
                     return self.handleError(err);
                 };
             } else |err| switch (err) {
-                error.InterruptedSystemCall => self.socketSubmit(),
+                error.InterruptedSystemCall => self.listen(),
                 else => return self.handleError(err),
             }
         }
 
         fn listenComplete(self: *Self, res: io.SyscallError!void) void {
             if (res)
-                self.acceptSubmit()
+                self.accept()
             else |err| switch (err) {
-                error.InterruptedSystemCall => self.socketSubmit(),
+                error.InterruptedSystemCall => self.listen(),
                 else => return self.handleError(err),
             }
         }
 
-        fn acceptSubmit(self: *Self) void {
+        fn accept(self: *Self) void {
             self.op = self.loop.accept(self.fd, self, acceptComplete) catch |err| {
                 return self.handleError(err);
             };
@@ -169,7 +159,7 @@ pub fn Listener(comptime Parent: type, comptime parent_field_name: []const u8) t
                 error.InterruptedSystemCall => {},
                 else => return self.handleError(err),
             }
-            self.acceptSubmit();
+            self.accept();
         }
 
         fn handleError(self: *Self, err: anyerror) void {
