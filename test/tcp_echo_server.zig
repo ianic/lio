@@ -2,7 +2,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 const posix = std.posix;
-const io = @import("iox");
+const io = @import("lio");
 const mem = std.mem;
 
 const log = std.log.scoped(.main);
@@ -33,12 +33,12 @@ pub fn main() !void {
         try loop.runFor(1000);
         log.debug("run: {} bytes: {} MB: {} ops: {} active: {}", .{
             i,
-            bytes,
-            bytes / 1000_000,
+            total_bytes,
+            total_bytes / 1000_000,
             loop.metric.processed_op -% prev_metric.processed_op,
             loop.metric.active_op,
         });
-        bytes = 0;
+        total_bytes = 0;
         prev_metric = loop.metric;
     }
 
@@ -46,7 +46,7 @@ pub fn main() !void {
     try loop.drain();
 }
 
-var bytes: usize = 0;
+var total_bytes: usize = 0;
 
 const Listener = struct {
     const Self = @This();
@@ -79,8 +79,7 @@ const Connection = struct {
     tcp: io.tcp.Connection(Self, "tcp"),
 
     buffer: [1024 * 64]u8 = undefined,
-    head: u32 = 0,
-    tail: u32 = 0,
+    recv_bytes: u32 = 0,
 
     pub fn init(parent: *Listener, fd: linux.fd_t) Self {
         return .{
@@ -94,19 +93,13 @@ const Connection = struct {
     }
 
     pub fn onRecv(self: *Self, n: u32) !void {
-        bytes += n;
-        self.head = 0;
-        self.tail = n;
-        self.tcp.send(self.buffer[self.head..self.tail]);
+        total_bytes += n;
+        self.recv_bytes = n;
+        self.tcp.send(self.buffer[0..self.recv_bytes]);
     }
 
-    pub fn onSend(self: *Self, n: u32) !void {
-        self.head += n;
-        if (self.head == self.tail) {
-            self.recv();
-        } else {
-            self.tcp.send(self.buffer[self.head..self.tail]);
-        }
+    pub fn onSend(self: *Self, _: []const u8) !void {
+        self.recv();
     }
 
     pub fn onClose(self: *Self, _: anyerror) void {

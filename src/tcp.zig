@@ -188,8 +188,9 @@ pub fn Connection(comptime Parent: type, comptime parent_field_name: []const u8)
         ops: [2]usize = .{ 0, 0 },
 
         // Remember used buffer so we can repeat operation on interrupt
-        send_buffer: []const u8 = &.{},
         recv_buffer: []u8 = &.{},
+        send_buffer: []const u8 = &.{},
+        send_len: usize = 0,
 
         inline fn parent(self: *Self) *Parent {
             return @alignCast(@fieldParentPtr(parent_field_name, self));
@@ -200,20 +201,33 @@ pub fn Connection(comptime Parent: type, comptime parent_field_name: []const u8)
         }
 
         pub fn send(self: *Self, buffer: []const u8) void {
-            self.ops[0] = self.loop.send(self.fd, buffer, self, sendComplete) catch |err| {
+            assert(self.send_buffer.len == 0);
+            self.send_buffer = buffer;
+            self.send_len = 0;
+            self.sendSubmit();
+        }
+
+        fn sendSubmit(self: *Self) void {
+            const buf = self.send_buffer[self.send_len..];
+            self.ops[0] = self.loop.send(self.fd, buf, self, sendComplete) catch |err| {
                 return self.handleError(err);
             };
-            self.send_buffer = buffer;
         }
 
         fn sendComplete(self: *Self, res: io.SyscallError!u32) void {
             if (res) |n| {
+                self.send_len += n;
+                if (self.send_len < self.send_buffer.len) {
+                    // short send, send rest of the data
+                    return self.sendSubmit();
+                }
+                const buf = self.send_buffer;
                 self.send_buffer = &.{};
-                self.parent().onSend(n) catch |err| {
+                self.parent().onSend(buf) catch |err| {
                     return self.handleError(err);
                 };
             } else |err| switch (err) {
-                error.InterruptedSystemCall => self.send(self.send_buffer),
+                error.InterruptedSystemCall => self.sendSubmit(),
                 error.OperationCanceled => unreachable,
                 else => self.handleError(err),
             }

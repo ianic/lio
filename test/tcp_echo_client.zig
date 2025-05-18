@@ -2,7 +2,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 const posix = std.posix;
-const io = @import("iox");
+const io = @import("lio");
 const mem = std.mem;
 
 const log = std.log.scoped(.main);
@@ -76,10 +76,9 @@ const Connection = struct {
     tcp: io.tcp.Connection(Self, "tcp"),
 
     buffer: [64 * 1024]u8 = undefined,
-    send_head: u32 = 0,
-    send_tail: u32 = 0,
+    send_bytes: u32 = 0,
     recv_pos: u32 = 0,
-    bytes_received: usize = 0,
+    total_bytes: usize = 0,
 
     fn init(parent: *Connector, fd: linux.fd_t) Self {
         return .{
@@ -90,7 +89,7 @@ const Connection = struct {
 
     // Start echo cycle, send random bytes and expect to receive same bytes
     fn echo(self: *Self) void {
-        if (self.bytes_received > 1024 * 1024 * 1024) {
+        if (self.total_bytes > 1024 * 1024 * 1024) {
             self.tcp.close() catch unreachable;
             //self.parent.tcp.connect();
             self.parent.onError(error.EndOfFile);
@@ -98,27 +97,19 @@ const Connection = struct {
         }
 
         self.recv_pos = 0;
-        self.send_tail = rnd.intRangeAtMost(u32, 16, 64 * 1024);
-        self.send_head = 0;
-        self.tcp.send(buffer[self.send_head..self.send_tail]);
+        self.send_bytes = rnd.intRangeAtMost(u32, 16, 64 * 1024);
+        self.tcp.send(buffer[0..self.send_bytes]);
     }
 
-    pub fn onSend(self: *Self, n: u32) !void {
-        self.send_head += n;
-        if (self.send_head == self.send_tail) {
-            self.tcp.recv(&self.buffer);
-        } else {
-            // can't happen because we are sending with msg.waitall in Loop.send
-            log.err("short send", .{});
-            self.tcp.send(buffer[self.send_head..self.send_tail]);
-        }
+    pub fn onSend(self: *Self, _: []const u8) !void {
+        self.tcp.recv(&self.buffer);
     }
 
     pub fn onRecv(self: *Self, n: u32) !void {
         assert(std.mem.eql(u8, self.buffer[0..n], buffer[self.recv_pos..][0..n]));
         self.recv_pos += n;
-        self.bytes_received += n;
-        if (self.recv_pos == self.send_tail) {
+        self.total_bytes += n;
+        if (self.recv_pos == self.send_bytes) {
             self.echo();
         } else {
             self.tcp.recv(&self.buffer);
