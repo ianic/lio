@@ -27,6 +27,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const tls_module = b.dependency(
+        "tls",
+        .{ .target = target, .optimize = optimize },
+    ).module("tls");
+    lib_mod.addImport("tls", tls_module);
 
     // We will also create a module for our other entry point, 'main.zig'.
     const exe_mod = b.createModule(.{
@@ -119,6 +124,8 @@ pub fn build(b: *std.Build) void {
         //"interrupt",
         "tcp_echo_server",
         "tcp_echo_client",
+        "http_client",
+        "https_client",
     };
     inline for (examples) |path| {
         const source_file = "test/" ++ path ++ ".zig";
@@ -130,7 +137,8 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         test_exe.linkLibC();
-        test_exe.root_module.addImport("iox", lib_mod);
+        test_exe.root_module.addImport("lio", lib_mod);
+        test_exe.root_module.addImport("tls", tls_module);
         b.installArtifact(test_exe);
     }
 }

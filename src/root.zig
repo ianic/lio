@@ -7,3 +7,4 @@ pub const BufferGroup = linux.IoUring.BufferGroup;
 pub const SyscallError = @import("errno.zig").Error;
 
 pub const tcp = @import("tcp.zig");
+pub const tls = @import("tls.zig");
