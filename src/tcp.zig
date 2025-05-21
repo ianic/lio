@@ -5,7 +5,12 @@ const io = @import("root.zig");
 
 const log = std.log.scoped(.tcp);
 
-pub fn Connector(comptime Parent: type, comptime parent_field_name: []const u8) type {
+pub fn Connector(
+    comptime Parent: type,
+    comptime parent_field_name: []const u8,
+    comptime onConnect: *const fn (*Parent, linux.fd_t) anyerror!void,
+    comptime onError: *const fn (*Parent, err: anyerror) void,
+) type {
     return struct {
         const Self = @This();
 
@@ -44,7 +49,7 @@ pub fn Connector(comptime Parent: type, comptime parent_field_name: []const u8) 
 
         fn connectComplete(self: *Self, res: io.SyscallError!void) void {
             if (res) {
-                self.parent().onConnect(self.fd) catch |err| return self.handleError(err);
+                onConnect(self.parent(), self.fd) catch |err| return self.handleError(err);
                 self.fd = -2; // fd ownership transferred to the connection
             } else |err| {
                 self.handleError(err);
@@ -56,7 +61,7 @@ pub fn Connector(comptime Parent: type, comptime parent_field_name: []const u8) 
                 log.err("connector close {}", .{e});
                 self.fd = -1;
             };
-            self.parent().onError(err);
+            onError(self.parent(), err);
         }
 
         pub fn close(self: *Self) !void {
@@ -87,7 +92,12 @@ pub fn isNetworkError(err: anyerror) bool {
     };
 }
 
-pub fn Listener(comptime Parent: type, comptime parent_field_name: []const u8) type {
+pub fn Listener(
+    comptime Parent: type,
+    comptime parent_field_name: []const u8,
+    comptime onAccept: *const fn (*Parent, linux.fd_t) anyerror!void,
+    comptime onError: *const fn (*Parent, anyerror) void,
+) type {
     return struct {
         const Self = @This();
 
@@ -152,7 +162,7 @@ pub fn Listener(comptime Parent: type, comptime parent_field_name: []const u8) t
 
         fn acceptComplete(self: *Self, res: io.SyscallError!linux.fd_t) void {
             if (res) |fd|
-                self.parent().onAccept(fd) catch |err| {
+                onAccept(self.parent(), fd) catch |err| {
                     return self.handleError(err);
                 }
             else |err| switch (err) {
@@ -167,7 +177,7 @@ pub fn Listener(comptime Parent: type, comptime parent_field_name: []const u8) t
                 log.err("connector close {}", .{e});
                 self.fd = -1;
             };
-            self.parent().onError(err);
+            onError(self.parent(), err);
         }
 
         pub fn close(self: *Self) !void {
@@ -179,7 +189,13 @@ pub fn Listener(comptime Parent: type, comptime parent_field_name: []const u8) t
     };
 }
 
-pub fn Connection(comptime Parent: type, comptime parent_field_name: []const u8) type {
+pub fn Connection(
+    comptime Parent: type,
+    comptime parent_field_name: []const u8,
+    comptime onRecv: *const fn (*Parent, u32) anyerror!void,
+    comptime onSend: *const fn (*Parent, []const u8) anyerror!void,
+    comptime onClose: *const fn (*Parent, anyerror) void,
+) type {
     return struct {
         const Self = @This();
 
@@ -223,7 +239,7 @@ pub fn Connection(comptime Parent: type, comptime parent_field_name: []const u8)
                 }
                 const buf = self.send_buffer;
                 self.send_buffer = &.{};
-                self.parent().onSend(buf) catch |err| {
+                onSend(self.parent(), buf) catch |err| {
                     return self.handleError(err);
                 };
             } else |err| switch (err) {
@@ -244,7 +260,7 @@ pub fn Connection(comptime Parent: type, comptime parent_field_name: []const u8)
             if (res) |n| {
                 self.recv_buffer = &.{};
                 if (n == 0) return self.handleError(error.EndOfFile); // clean close
-                self.parent().onRecv(n) catch |err| {
+                onRecv(self.parent(), n) catch |err| {
                     return self.handleError(err);
                 };
             } else |err| switch (err) {
@@ -259,7 +275,7 @@ pub fn Connection(comptime Parent: type, comptime parent_field_name: []const u8)
                 log.err("tcp close {}", .{e});
                 self.fd = -1;
             };
-            self.parent().onClose(err);
+            onClose(self.parent(), err);
         }
 
         pub fn close(self: *Self) !void {

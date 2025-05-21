@@ -53,16 +53,16 @@ const Listener = struct {
 
     allocator: mem.Allocator,
     loop: *io.Loop,
-    tcp: io.tcp.Listener(Self, "tcp"),
+    tcp: io.tcp.Listener(Self, "tcp", onAccept, onError),
 
-    pub fn onAccept(self: *Self, fd: posix.fd_t) !void {
+    fn onAccept(self: *Self, fd: posix.fd_t) anyerror!void {
         const conn = try self.allocator.create(Connection);
         errdefer self.allocator.destroy(conn);
         conn.* = .init(self, fd);
         conn.recv();
     }
 
-    pub fn onError(self: *Self, err: anyerror) void {
+    fn onError(self: *Self, err: anyerror) void {
         log.err("listener {}", .{err});
         self.tcp.listen();
     }
@@ -75,16 +75,16 @@ const Listener = struct {
 const Connection = struct {
     const Self = @This();
 
-    parent: *Listener,
-    tcp: io.tcp.Connection(Self, "tcp"),
+    listener: *Listener,
+    tcp: io.tcp.Connection(Self, "tcp", onRecv, onSend, onClose),
 
     buffer: [1024 * 64]u8 = undefined,
     recv_bytes: u32 = 0,
 
-    pub fn init(parent: *Listener, fd: linux.fd_t) Self {
+    pub fn init(listener: *Listener, fd: linux.fd_t) Self {
         return .{
-            .parent = parent,
-            .tcp = .init(parent.loop, fd),
+            .listener = listener,
+            .tcp = .init(listener.loop, fd),
         };
     }
 
@@ -92,17 +92,17 @@ const Connection = struct {
         self.tcp.recv(&self.buffer);
     }
 
-    pub fn onRecv(self: *Self, n: u32) !void {
+    fn onRecv(self: *Self, n: u32) !void {
         total_bytes += n;
         self.recv_bytes = n;
         self.tcp.send(self.buffer[0..self.recv_bytes]);
     }
 
-    pub fn onSend(self: *Self, _: []const u8) !void {
+    fn onSend(self: *Self, _: []const u8) !void {
         self.recv();
     }
 
-    pub fn onClose(self: *Self, _: anyerror) void {
-        self.parent.destroy(self);
+    fn onClose(self: *Self, _: anyerror) void {
+        self.listener.destroy(self);
     }
 };
