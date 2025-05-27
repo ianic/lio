@@ -7,7 +7,7 @@ const mem = std.mem;
 const io = @import("root.zig");
 const tcp = @import("tcp.zig");
 
-const log = std.log.scoped(.tcp);
+const log = std.log.scoped(.tls);
 
 pub fn Connector(
     comptime Parent: type,
@@ -27,7 +27,7 @@ pub fn Connector(
         send_buf: [tls.max_ciphertext_record_len]u8 = undefined,
 
         inline fn parent(self: *Self) *Parent {
-            return @fieldParentPtr(parent_field_name, self);
+            return @alignCast(@fieldParentPtr(parent_field_name, self));
         }
 
         pub fn init(
@@ -112,6 +112,81 @@ pub fn Connector(
             self.tcp_connector.close() catch {};
             self.tcp_conn.close() catch {};
             _ = err catch unreachable;
+        }
+    };
+}
+
+pub fn Connection(
+    comptime Parent: type,
+    comptime parent_field_name: []const u8,
+    comptime onRecv: *const fn (*Parent, []const u8) anyerror!void,
+    comptime onClose: *const fn (*Parent, anyerror) void,
+) type {
+    return struct {
+        const Self = @This();
+
+        allocator: mem.Allocator,
+        tcp: io.tcp.Connection(Self, "tcp", onTcpRecv, onTcpSend, onTcpClose),
+        tls: tls.nonblock.Connection,
+
+        recv_buf: [tls.max_ciphertext_record_len]u8 = undefined,
+        recv_tail: usize = 0,
+
+        pub fn init(
+            allocator: mem.Allocator,
+            loop: *io.Loop,
+            fd: linux.fd_t,
+            tls_conn: tls.nonblock.Connection,
+        ) Self {
+            return .{
+                .allocator = allocator,
+                .tcp = .init(loop, fd),
+                .tls = tls_conn,
+            };
+        }
+
+        inline fn parent(self: *Self) *Parent {
+            return @alignCast(@fieldParentPtr(parent_field_name, self));
+        }
+
+        pub fn send(self: *Self, cleartext: []const u8) !void {
+            const ciphertext = try self.allocator.alloc(u8, self.tls.encryptedLength(cleartext.len));
+            errdefer self.allocator.free(ciphertext);
+            const res = try self.tls.encrypt(cleartext, ciphertext);
+            self.tcp.send(res.ciphertext);
+            self.tcp.recv(self.recv_buf[self.recv_tail..]);
+        }
+
+        fn onTcpSend(self: *Self, ciphertext: []const u8) !void {
+            self.allocator.free(ciphertext);
+        }
+
+        fn onTcpRecv(self: *Self, n: u32) !void {
+            self.recv_tail += n;
+            try self.decrypt();
+            self.tcp.recv(self.recv_buf[self.recv_tail..]);
+        }
+
+        fn decrypt(self: *Self) !void {
+            const res = try self.tls.decrypt(self.recv_buf[0..self.recv_tail], &self.recv_buf);
+            if (res.cleartext.len > 0) {
+                try onRecv(self.parent(), res.cleartext);
+            }
+
+            if (res.unused_ciphertext.len == 0) {
+                self.recv_tail = 0;
+            } else if (res.unused_ciphertext.len > 0) {
+                @memmove(self.recv_buf[0..res.unused_ciphertext.len], res.unused_ciphertext);
+                self.recv_tail = res.unused_ciphertext.len;
+            }
+        }
+
+        pub fn close(self: *Self) !void {
+            try self.tcp.close();
+        }
+
+        fn onTcpClose(self: *Self, err: anyerror) void {
+            onClose(self.parent(), err);
         }
     };
 }

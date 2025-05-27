@@ -280,7 +280,6 @@ pub fn Connection(
 
         pub fn close(self: *Self) !void {
             if (self.fd < 0) return;
-            // TODO: ovo ne vraca error
             for (self.ops) |op| try self.loop.detach(op, self);
             try self.loop.close(self.fd);
             self.fd = -1;
