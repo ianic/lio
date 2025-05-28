@@ -2,7 +2,6 @@ const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 const io = @import("root.zig");
-
 const log = std.log.scoped(.tcp);
 
 pub fn Connector(
@@ -18,7 +17,7 @@ pub fn Connector(
         addr: std.net.Address,
         connect_timeout: linux.kernel_timespec = .{ .sec = 10, .nsec = 0 },
         fd: linux.fd_t = -1,
-        op: usize = 0,
+        op: ?u32 = null,
 
         inline fn parent(self: *Self) *Parent {
             return @alignCast(@fieldParentPtr(parent_field_name, self));
@@ -30,7 +29,7 @@ pub fn Connector(
 
         pub fn connect(self: *Self) void {
             assert(self.fd < 0);
-            self.op = self.loop.socket(self.addr.any.family, linux.SOCK.STREAM, self, socketComplete) catch |err| {
+            self.loop.socket(Self, socketComplete, "op", &self.op, self.addr.any.family, linux.SOCK.STREAM) catch |err| {
                 return self.handleError(err);
             };
         }
@@ -38,7 +37,7 @@ pub fn Connector(
         fn socketComplete(self: *Self, res: io.SyscallError!linux.fd_t) void {
             if (res) |fd| {
                 self.fd = fd;
-                self.op = self.loop.connect(fd, &self.addr, &self.connect_timeout, self, connectComplete) catch |err| {
+                self.loop.connect(Self, connectComplete, "op", &self.op, fd, &self.addr, &self.connect_timeout) catch |err| {
                     return self.handleError(err);
                 };
             } else |err| switch (err) {
@@ -66,7 +65,7 @@ pub fn Connector(
 
         pub fn close(self: *Self) !void {
             if (self.fd < 0) return;
-            try self.loop.detach(self.op, self);
+            if (self.op) |op| try self.loop.detach(op);
             try self.loop.close(self.fd);
             self.fd = -1;
         }
@@ -105,7 +104,7 @@ pub fn Listener(
         addr: std.net.Address,
         fd: linux.fd_t = -1,
         listen_options: std.net.Address.ListenOptions = .{ .reuse_address = true },
-        op: usize = 0,
+        op: ?u32 = null,
 
         inline fn parent(self: *Self) *Parent {
             return @alignCast(@fieldParentPtr(parent_field_name, self));
@@ -117,12 +116,7 @@ pub fn Listener(
 
         pub fn listen(self: *Self) void {
             assert(self.fd < 0);
-            self.op = self.loop.socket(
-                self.addr.any.family,
-                linux.SOCK.STREAM,
-                self,
-                socketComplete,
-            ) catch |err| {
+            self.loop.socket(Self, socketComplete, "op", &self.op, self.addr.any.family, linux.SOCK.STREAM) catch |err| {
                 return self.handleError(err);
             };
         }
@@ -130,13 +124,7 @@ pub fn Listener(
         fn socketComplete(self: *Self, res: io.SyscallError!linux.fd_t) void {
             if (res) |fd| {
                 self.fd = fd;
-                self.op = self.loop.listen(
-                    fd,
-                    &self.addr,
-                    self.listen_options,
-                    self,
-                    listenComplete,
-                ) catch |err| {
+                self.loop.listen(Self, listenComplete, "op", &self.op, fd, &self.addr, self.listen_options) catch |err| {
                     return self.handleError(err);
                 };
             } else |err| switch (err) {
@@ -155,7 +143,7 @@ pub fn Listener(
         }
 
         fn accept(self: *Self) void {
-            self.op = self.loop.accept(self.fd, self, acceptComplete) catch |err| {
+            self.loop.accept(Self, acceptComplete, "op", &self.op, self.fd) catch |err| {
                 return self.handleError(err);
             };
         }
@@ -182,7 +170,7 @@ pub fn Listener(
 
         pub fn close(self: *Self) !void {
             if (self.fd < 0) return;
-            try self.loop.detach(self.op, self);
+            if (self.op) |op| try self.loop.detach(op);
             try self.loop.close(self.fd);
             self.fd = -1;
         }
@@ -201,7 +189,8 @@ pub fn Connection(
 
         loop: *io.Loop,
         fd: linux.fd_t = -1,
-        ops: [2]usize = .{ 0, 0 },
+        send_op: ?u32 = null,
+        recv_op: ?u32 = null,
 
         // Remember used buffer so we can repeat operation on interrupt
         recv_buffer: []u8 = &.{},
@@ -225,7 +214,7 @@ pub fn Connection(
 
         fn sendSubmit(self: *Self) void {
             const buf = self.send_buffer[self.send_len..];
-            self.ops[0] = self.loop.send(self.fd, buf, self, sendComplete) catch |err| {
+            self.loop.send(Self, sendComplete, "send_op", &self.send_op, self.fd, buf) catch |err| {
                 return self.handleError(err);
             };
         }
@@ -250,7 +239,7 @@ pub fn Connection(
         }
 
         pub fn recv(self: *Self, buffer: []u8) void {
-            self.ops[1] = self.loop.recv(self.fd, buffer, self, recvComplete) catch |err| {
+            self.loop.recv(Self, recvComplete, "recv_op", &self.recv_op, self.fd, buffer) catch |err| {
                 return self.handleError(err);
             };
             self.recv_buffer = buffer;
@@ -280,60 +269,10 @@ pub fn Connection(
 
         pub fn close(self: *Self) !void {
             if (self.fd < 0) return;
-            for (self.ops) |op| try self.loop.detach(op, self);
+            if (self.recv_op) |op| try self.loop.detach(op);
+            if (self.send_op) |op| try self.loop.detach(op);
             try self.loop.close(self.fd);
             self.fd = -1;
         }
     };
-}
-
-test "sizeOf" {
-    const T = struct {};
-    try std.testing.expectEqual(144, @sizeOf(Listener(T, "")));
-    try std.testing.expectEqual(152, @sizeOf(Connector(T, "")));
-}
-
-const posix = std.posix;
-const testing = std.testing;
-
-test "operation is canceled on close" {
-    var loop = try io.Loop.init(testing.allocator, .{
-        .entries = 16,
-        .fd_nr = 2,
-    });
-    defer loop.deinit();
-
-    const Handler = struct {
-        const Self = @This();
-        conn_count: usize = 0,
-
-        tcp: io.tcp.Listener(Self, "tcp"),
-
-        pub fn onAccept(self: *Self, fd: posix.fd_t) !void {
-            self.conn_count += 1;
-            try self.tcp.loop.close(fd);
-        }
-
-        pub fn onError(_: *Self, _: anyerror) void {
-            unreachable;
-        }
-    };
-    const addr: std.net.Address = try std.net.Address.resolveIp("127.0.0.1", 9991);
-    var handler: Handler = .{ .tcp = .init(&loop, addr) };
-    handler.tcp.listen();
-
-    try loop.tickNr(1); // create socket
-    try loop.tickNr(1); // listen
-
-    // sync connect
-    var stream = try std.net.tcpConnectToAddress(addr);
-    defer stream.close();
-
-    try loop.tickNr(1); // accept
-    try testing.expectEqual(1, handler.conn_count);
-
-    try handler.tcp.close();
-    // there is active listen operation which will be canceled
-    try testing.expectEqual(1, loop.metric.active_op);
-    try loop.drain();
 }
