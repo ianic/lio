@@ -89,10 +89,11 @@ const Connection = struct {
     }
 
     fn recv(self: *Self) void {
-        self.tcp.recv(&self.buffer);
+        self.tcp.recvInto(&self.buffer);
     }
 
-    fn onRecv(self: *Self, n: u32) !void {
+    fn onRecv(self: *Self, data: []u8) !void {
+        const n: u32 = @intCast(data.len);
         total_bytes += n;
         self.recv_bytes = n;
         self.tcp.send(self.buffer[0..self.recv_bytes]);

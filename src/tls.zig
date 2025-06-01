@@ -78,15 +78,15 @@ pub fn Connector(
                 return;
             }
 
-            self.tcp_conn.recv(self.recv_buf[self.recv_tail..]);
+            self.tcp_conn.recvInto(self.recv_buf[self.recv_tail..]);
         }
 
         fn onSend(self: *Self, _: []const u8) !void {
             self.handshake();
         }
 
-        fn onRecv(self: *Self, n: u32) !void {
-            self.recv_tail += n;
+        fn onRecv(self: *Self, data: []u8) !void {
+            self.recv_tail += data.len;
             self.handshake();
         }
 
@@ -154,17 +154,17 @@ pub fn Connection(
             errdefer self.allocator.free(ciphertext);
             const res = try self.tls.encrypt(cleartext, ciphertext);
             self.tcp.send(res.ciphertext);
-            self.tcp.recv(self.recv_buf[self.recv_tail..]);
+            self.tcp.recvInto(self.recv_buf[self.recv_tail..]);
         }
 
         fn onTcpSend(self: *Self, ciphertext: []const u8) !void {
             self.allocator.free(ciphertext);
         }
 
-        fn onTcpRecv(self: *Self, n: u32) !void {
-            self.recv_tail += n;
+        fn onTcpRecv(self: *Self, data: []u8) !void {
+            self.recv_tail += data.len;
             try self.decrypt();
-            self.tcp.recv(self.recv_buf[self.recv_tail..]);
+            self.tcp.recvInto(self.recv_buf[self.recv_tail..]);
         }
 
         fn decrypt(self: *Self) !void {
@@ -189,4 +189,28 @@ pub fn Connection(
             onClose(self.parent(), err);
         }
     };
+}
+
+test "sizeOf" {
+    const Client = struct {
+        const Self = @This();
+
+        connector: io.tls.Connector(Self, "connector", onConnect),
+        conn: io.tls.Connection(Self, "conn", onRecv, onClose),
+
+        fn onConnect(
+            _: *Self,
+            _: linux.fd_t,
+            _: tls.nonblock.Connection,
+            _: []const u8,
+        ) !void {}
+
+        fn onRecv(_: *Self, _: []const u8) !void {}
+        fn onClose(_: *Self, _: anyerror) void {}
+    };
+
+    try std.testing.expectEqual(84544, @sizeOf(Client));
+    try std.testing.expectEqual(67584, @sizeOf(Connector(Client, "connector", Client.onConnect)));
+    try std.testing.expectEqual(16960, @sizeOf(Connection(Client, "conn", Client.onRecv, Client.onClose)));
+    //std.debug.print("Client: {}\n", .{@sizeOf(Client)});
 }

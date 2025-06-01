@@ -8,3 +8,7 @@ pub const SyscallError = @import("errno.zig").Error;
 
 pub const tcp = @import("tcp.zig");
 pub const tls = @import("tls.zig");
+
+test {
+    _ = @import("tls.zig");
+}

@@ -24,8 +24,18 @@ pub const Options = struct {
 };
 
 pub const Op = struct {
+    const Callback = *const fn (*Loop, Op, linux.io_uring_cqe) void;
+
     ref: ?*?u32 = null,
-    callback: ?*const fn (Op, linux.io_uring_cqe) void = null,
+    callback: ?Callback = null,
+    args: union(enum) {
+        recv: struct { buffer_group_id: u16 },
+        // recv: union(enum) {
+        //     buffer_group_id: u16,
+        //     buffer: []u8,
+        // },
+        // send: []const u8,
+    } = undefined,
 
     /// Break connection with parent, replace callback with noop callback.
     fn detach(self: *Op) void {
@@ -50,9 +60,13 @@ metric: struct {
     active_op: usize = 0,
     /// Total number of processed operations
     processed_op: usize = 0,
+    /// Total number of successful receives into provieded buffers
+    recv: usize = 0,
+    /// Total number of receive operations failed with no buffer available
+    recv_no_buffer: usize = 0,
 } = .{},
 tick_timer_ts: ?linux.kernel_timespec = null,
-next_buffer_group_id: u16 = 0,
+buffer_groups: std.ArrayListUnmanaged(linux.IoUring.BufferGroup) = .empty,
 
 pub fn init(allocator: mem.Allocator, opt: Options) !Loop {
     var ring = try linux.IoUring.init(opt.entries, opt.flags);
@@ -66,6 +80,8 @@ pub fn init(allocator: mem.Allocator, opt: Options) !Loop {
 }
 
 pub fn deinit(self: *Loop) void {
+    for (self.buffer_groups.items) |*bg| bg.deinit(self.allocator);
+    self.buffer_groups.deinit(self.allocator);
     self.op_list.deinit();
     self.ring.deinit();
 }
@@ -105,7 +121,7 @@ fn processCompletions(self: *Loop) void {
                 self.next_free_op = idx;
                 if (op.callback != null) op.ref.?.* = null;
             }
-            if (op.callback) |callback| callback(op, cqe);
+            if (op.callback) |callback| callback(self, op, cqe);
             self.metric.processed_op +%= 1;
         }
         ring.cq_advance(@intCast(cqes.len));
@@ -204,8 +220,8 @@ fn getOrCreateOp(self: *Loop) error{OutOfMemory}!struct { *Op, usize } {
 fn prepareOp(
     self: *Loop,
     ref: *?u32,
-    callback: *const fn (Op, linux.io_uring_cqe) void,
-) error{OutOfMemory}!usize {
+    callback: Op.Callback,
+) error{OutOfMemory}!struct { *Op, usize } {
     const op, const idx = try self.getOrCreateOp();
     assert(ref.* == null);
     assert(op.ref == null);
@@ -215,7 +231,7 @@ fn prepareOp(
         .callback = callback,
     };
     ref.* = @intCast(idx);
-    return idx;
+    return .{ op, idx };
 }
 
 /// Get io_uring direct socket. If there are no free socket we will get:
@@ -230,8 +246,8 @@ pub fn socket(
     socket_type: u32,
 ) PrepareError!void {
     try self.ensureSqCapacity(1);
-    const user_data = try self.prepareOp(parent_field_ptr, struct {
-        fn callback(op: Op, cqe: linux.io_uring_cqe) void {
+    _, const user_data = try self.prepareOp(parent_field_ptr, struct {
+        fn callback(_: *Loop, op: Op, cqe: linux.io_uring_cqe) void {
             onComplete(
                 @alignCast(@fieldParentPtr(parent_field_name, op.ref orelse return)),
                 if (success(cqe)) @intCast(cqe.res) else |err| err,
@@ -254,8 +270,8 @@ pub fn listen(
     opt: std.net.Address.ListenOptions,
 ) PrepareError!void {
     try self.ensureSqCapacity(if (opt.reuse_address) 4 else 2);
-    const user_data = try self.prepareOp(parent_field_ptr, struct {
-        fn callback(op: Op, cqe: linux.io_uring_cqe) void {
+    _, const user_data = try self.prepareOp(parent_field_ptr, struct {
+        fn callback(_: *Loop, op: Op, cqe: linux.io_uring_cqe) void {
             onComplete(
                 @alignCast(@fieldParentPtr(parent_field_name, op.ref.?)),
                 if (success(cqe)) {} else |err| err,
@@ -307,8 +323,8 @@ pub fn connect(
     timeout: ?*linux.kernel_timespec,
 ) PrepareError!void {
     try self.ensureSqCapacity(2);
-    const user_data = try self.prepareOp(parent_field_ptr, struct {
-        fn callback(op: Op, cqe: linux.io_uring_cqe) void {
+    _, const user_data = try self.prepareOp(parent_field_ptr, struct {
+        fn callback(_: *Loop, op: Op, cqe: linux.io_uring_cqe) void {
             onComplete(
                 @alignCast(@fieldParentPtr(parent_field_name, op.ref.?)),
 
@@ -335,8 +351,8 @@ pub fn accept(
     fd: linux.fd_t,
 ) PrepareError!void {
     try self.ensureSqCapacity(1);
-    const user_data = try self.prepareOp(parent_field_ptr, struct {
-        fn callback(op: Op, cqe: linux.io_uring_cqe) void {
+    _, const user_data = try self.prepareOp(parent_field_ptr, struct {
+        fn callback(_: *Loop, op: Op, cqe: linux.io_uring_cqe) void {
             onComplete(
                 @alignCast(@fieldParentPtr(parent_field_name, op.ref.?)),
                 if (success(cqe)) @intCast(cqe.res) else |err| err,
@@ -363,8 +379,8 @@ pub fn recv(
     buffer: []u8,
 ) PrepareError!void {
     try self.ensureSqCapacity(1);
-    const user_data = try self.prepareOp(parent_field_ptr, struct {
-        fn callback(op: Op, cqe: linux.io_uring_cqe) void {
+    _, const user_data = try self.prepareOp(parent_field_ptr, struct {
+        fn callback(_: *Loop, op: Op, cqe: linux.io_uring_cqe) void {
             onComplete(
                 @alignCast(@fieldParentPtr(parent_field_name, op.ref.?)),
                 if (success(cqe)) @intCast(cqe.res) else |err| err,
@@ -373,6 +389,42 @@ pub fn recv(
     }.callback);
 
     var sqe = self.ring.recv(user_data, fd, .{ .buffer = buffer }, 0) catch unreachable;
+    sqe.flags |= linux.IOSQE_FIXED_FILE;
+}
+
+pub fn recvBufferGroup(
+    self: *Loop,
+    comptime Parent: type,
+    comptime onComplete: fn (*Parent, SyscallError![]u8) void,
+    comptime parent_field_name: []const u8,
+    parent_field_ptr: *?u32,
+    fd: linux.fd_t,
+    buffer_group_id: u16,
+) PrepareError!void {
+    try self.ensureSqCapacity(1);
+    var op, const user_data = try self.prepareOp(parent_field_ptr, struct {
+        fn callback(loop: *Loop, op: Op, cqe: linux.io_uring_cqe) void {
+            const ptr: *Parent = @alignCast(@fieldParentPtr(parent_field_name, op.ref.?));
+            if (success(cqe)) {
+                if (cqe.res == 0) return onComplete(ptr, &.{});
+                var bg = loop.buffer_groups.items[op.args.recv.buffer_group_id];
+                const buf = bg.get(cqe) catch unreachable;
+                onComplete(ptr, buf);
+                bg.put(cqe) catch unreachable;
+                loop.metric.recv +%= 1;
+            } else |err| {
+                onComplete(ptr, err);
+                switch (err) {
+                    error.NoBufferSpaceAvailable => loop.metric.recv_no_buffer +%= 1,
+                    else => {},
+                }
+            }
+        }
+    }.callback);
+    op.args = .{ .recv = .{ .buffer_group_id = buffer_group_id } };
+
+    var bg = self.buffer_groups.items[buffer_group_id];
+    var sqe = bg.recv(user_data, fd, 0) catch unreachable;
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 }
 
@@ -392,8 +444,8 @@ pub fn send(
     buffer: []const u8,
 ) PrepareError!void {
     try self.ensureSqCapacity(1);
-    const user_data = try self.prepareOp(parent_field_ptr, struct {
-        fn callback(op: Op, cqe: linux.io_uring_cqe) void {
+    _, const user_data = try self.prepareOp(parent_field_ptr, struct {
+        fn callback(_: *Loop, op: Op, cqe: linux.io_uring_cqe) void {
             onComplete(
                 @alignCast(@fieldParentPtr(parent_field_name, op.ref.?)),
                 if (success(cqe)) @intCast(cqe.res) else |err| err,
@@ -442,20 +494,22 @@ fn tickTimer(self: *Loop, ts: *linux.kernel_timespec) SubmitError!void {
     _ = self.ring.timeout(timer_user_data, ts, 0, 0) catch unreachable;
 }
 
-pub fn initBufferGroup(
+pub fn addBufferGroup(
     self: *Loop,
     buffer_size: u32,
     buffers_count: u16,
-) !linux.IoUring.BufferGroup {
+) !u16 {
+    const idx: u16 = @intCast(self.buffer_groups.items.len);
+    try self.buffer_groups.ensureTotalCapacityPrecise(self.allocator, idx + 1);
     const bg = try linux.IoUring.BufferGroup.init(
         &self.ring,
         self.allocator,
-        self.next_buffer_group_id,
+        idx,
         buffer_size,
         buffers_count,
     );
-    self.next_buffer_group_id += 1;
-    return bg;
+    self.buffer_groups.appendAssumeCapacity(bg);
+    return idx;
 }
 
 test "socket" {
@@ -714,5 +768,5 @@ fn testSend(addr: std.net.Address) void {
 }
 
 test "size" {
-    try testing.expectEqual(16, @sizeOf(Op));
+    try testing.expectEqual(24, @sizeOf(Op));
 }

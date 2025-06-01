@@ -75,7 +75,7 @@ const Client = struct {
     }
 
     fn onConnect(
-        self: *Client,
+        self: *Self,
         fd: linux.fd_t,
         tls_conn: tls.nonblock.Connection,
         recv_buf: []const u8,

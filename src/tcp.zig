@@ -180,7 +180,7 @@ pub fn Listener(
 pub fn Connection(
     comptime Parent: type,
     comptime parent_field_name: []const u8,
-    comptime onRecv: *const fn (*Parent, u32) anyerror!void,
+    comptime onRecv: *const fn (*Parent, []u8) anyerror!void,
     comptime onSend: *const fn (*Parent, []const u8) anyerror!void,
     comptime onClose: *const fn (*Parent, anyerror) void,
 ) type {
@@ -189,6 +189,7 @@ pub fn Connection(
 
         loop: *io.Loop,
         fd: linux.fd_t = -1,
+        buffer_group_id: u16 = 0,
         send_op: ?u32 = null,
         recv_op: ?u32 = null,
 
@@ -202,7 +203,10 @@ pub fn Connection(
         }
 
         pub fn init(loop: *io.Loop, fd: linux.fd_t) Self {
-            return .{ .loop = loop, .fd = fd };
+            return .{
+                .loop = loop,
+                .fd = fd,
+            };
         }
 
         pub fn send(self: *Self, buffer: []const u8) void {
@@ -238,22 +242,50 @@ pub fn Connection(
             }
         }
 
-        pub fn recv(self: *Self, buffer: []u8) void {
-            self.loop.recv(Self, recvComplete, "recv_op", &self.recv_op, self.fd, buffer) catch |err| {
+        pub fn recvInto(self: *Self, buffer: []u8) void {
+            self.loop.recv(Self, recvIntoComplete, "recv_op", &self.recv_op, self.fd, buffer) catch |err| {
                 return self.handleError(err);
             };
             self.recv_buffer = buffer;
         }
 
-        fn recvComplete(self: *Self, res: io.SyscallError!u32) void {
+        fn recvIntoComplete(self: *Self, res: io.SyscallError!u32) void {
             if (res) |n| {
+                const buf = self.recv_buffer[0..n];
                 self.recv_buffer = &.{};
                 if (n == 0) return self.handleError(error.EndOfFile); // clean close
-                onRecv(self.parent(), n) catch |err| {
+                onRecv(self.parent(), buf) catch |err| {
                     return self.handleError(err);
                 };
             } else |err| switch (err) {
-                error.InterruptedSystemCall => self.recv(self.recv_buffer),
+                error.InterruptedSystemCall => self.recvInto(self.recv_buffer),
+                error.OperationCanceled => unreachable,
+                else => self.handleError(err),
+            }
+        }
+
+        /// Receive using provided buffers from the self.buffer_group_id.
+        pub fn recv(self: *Self) void {
+            self.loop.recvBufferGroup(
+                Self,
+                recvComplete,
+                "recv_op",
+                &self.recv_op,
+                self.fd,
+                self.buffer_group_id,
+            ) catch |err| {
+                return self.handleError(err);
+            };
+        }
+
+        fn recvComplete(self: *Self, res: io.SyscallError![]u8) void {
+            if (res) |buf| {
+                if (buf.len == 0) return self.handleError(error.EndOfFile);
+                onRecv(self.parent(), buf) catch |err| {
+                    return self.handleError(err);
+                };
+            } else |err| switch (err) {
+                error.NoBufferSpaceAvailable, error.InterruptedSystemCall => self.recv(),
                 error.OperationCanceled => unreachable,
                 else => self.handleError(err),
             }

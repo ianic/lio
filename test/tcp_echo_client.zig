@@ -22,6 +22,7 @@ pub fn main() !void {
         .fd_nr = 32,
     });
     defer loop.deinit();
+    _ = try loop.addBufferGroup(64 * 1024, 8);
 
     buffer = try gpa.alloc(u8, 64 * 1024);
     rnd.bytes(buffer);
@@ -35,8 +36,17 @@ pub fn main() !void {
         cli.connector.connect();
     }
 
-    while (true)
-        try loop.tick();
+    var prev_metric = loop.metric;
+    var i: usize = 1;
+    while (true) : (i +%= 1) {
+        try loop.runFor(10000);
+        log.debug("run: {} recv: {} no buffers: {}", .{
+            i,
+            loop.metric.recv -% prev_metric.recv,
+            loop.metric.recv_no_buffer -% prev_metric.recv_no_buffer,
+        });
+        prev_metric = loop.metric;
+    }
 }
 
 const Client = struct {
@@ -69,7 +79,7 @@ const Client = struct {
 
     fn onConnectError(self: *Self, err: anyerror) void {
         if (io.tcp.isNetworkError(err)) {
-            log.debug("reconnect {} on {}", .{ self.no, err });
+            //log.debug("reconnect {} on {}", .{ self.no, err });
             return self.connector.connect();
         }
         log.err("connector {}", .{err});
@@ -89,17 +99,18 @@ const Client = struct {
     }
 
     fn onSend(self: *Self, _: []const u8) !void {
-        self.conn.recv(&self.buffer);
+        self.conn.recv();
     }
 
-    fn onRecv(self: *Self, n: u32) !void {
-        assert(std.mem.eql(u8, self.buffer[0..n], buffer[self.recv_pos..][0..n]));
+    fn onRecv(self: *Self, data: []u8) !void {
+        const n: u32 = @intCast(data.len);
+        assert(std.mem.eql(u8, data, buffer[self.recv_pos..][0..n]));
         self.recv_pos += n;
         self.total_bytes += n;
         if (self.recv_pos == self.send_bytes) {
             self.echo();
         } else {
-            self.conn.recv(&self.buffer);
+            self.conn.recv();
         }
     }
 
@@ -114,66 +125,5 @@ const Client = struct {
             },
         }
         self.onConnectError(err);
-    }
-};
-
-const Connection = struct {
-    const Self = @This();
-
-    parent: *Client,
-    tcp: io.tcp.Connection(Self, "tcp", onRecv, onSend, onClose),
-
-    buffer: [64 * 1024]u8 = undefined,
-    send_bytes: u32 = 0,
-    recv_pos: u32 = 0,
-    total_bytes: usize = 0,
-
-    fn init(parent: *Client, fd: linux.fd_t) Self {
-        return .{
-            .parent = parent,
-            .tcp = .init(parent.loop, fd),
-        };
-    }
-
-    // Start echo cycle, send random bytes and expect to receive same bytes
-    fn echo(self: *Self) void {
-        if (self.total_bytes > 1024 * 1024 * 1024) {
-            self.tcp.close() catch unreachable;
-            //self.parent.tcp.connect();
-            self.parent.onConnectError(error.EndOfFile);
-            return;
-        }
-
-        self.recv_pos = 0;
-        self.send_bytes = rnd.intRangeAtMost(u32, 16, 64 * 1024);
-        self.tcp.send(buffer[0..self.send_bytes]);
-    }
-
-    pub fn onSend(self: *Self, _: []const u8) !void {
-        self.tcp.recv(&self.buffer);
-    }
-
-    pub fn onRecv(self: *Self, n: u32) !void {
-        assert(std.mem.eql(u8, self.buffer[0..n], buffer[self.recv_pos..][0..n]));
-        self.recv_pos += n;
-        self.total_bytes += n;
-        if (self.recv_pos == self.send_bytes) {
-            self.echo();
-        } else {
-            self.tcp.recv(&self.buffer);
-        }
-    }
-
-    pub fn onClose(self: *Self, err: anyerror) void {
-        switch (err) {
-            error.EndOfFile => {},
-            error.BrokenPipe, error.ConnectionResetByPeer => {
-                log.debug("connection close {}", .{err});
-            },
-            else => {
-                log.err("connection close {}", .{err});
-            },
-        }
-        self.parent.onConnectError(err);
     }
 };

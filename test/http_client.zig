@@ -20,6 +20,7 @@ pub fn main() !void {
         .fd_nr = 32,
     });
     defer loop.deinit();
+    _ = try loop.addBufferGroup(4096, 1);
 
     var cli: Client = .init(&loop, addr, host);
     cli.connector.connect();
@@ -72,12 +73,12 @@ const Client = struct {
     }
 
     fn onSend(self: *Self, _: []const u8) !void {
-        self.conn.recv(&self.buffer);
+        self.conn.recv();
     }
 
-    fn onRecv(self: *Self, n: u32) !void {
-        std.debug.print("{s}", .{self.buffer[0..n]});
-        self.conn.recv(&self.buffer);
+    fn onRecv(self: *Self, data: []u8) !void {
+        std.debug.print("{s}", .{data});
+        self.conn.recv();
     }
 
     fn onClose(self: *Self, err: anyerror) void {
