@@ -128,21 +128,23 @@ pub fn Connection(
         allocator: mem.Allocator,
         tcp: io.tcp.Connection(Self, "tcp", onTcpRecv, onTcpSend, onTcpClose),
         tls: tls.nonblock.Connection,
-
-        recv_buf: [tls.max_ciphertext_record_len]u8 = undefined,
-        recv_tail: usize = 0,
+        recv_buf: io.UnusedDataBuffer = .{},
 
         pub fn init(
             allocator: mem.Allocator,
             loop: *io.Loop,
             fd: linux.fd_t,
             tls_conn: tls.nonblock.Connection,
-        ) Self {
-            return .{
+            unused_handshake_buffer: []const u8,
+        ) !Self {
+            var self = Self{
                 .allocator = allocator,
                 .tcp = .init(loop, fd),
                 .tls = tls_conn,
             };
+            if (unused_handshake_buffer.len > 0)
+                try self.recv_buf.set(allocator, unused_handshake_buffer);
+            return self;
         }
 
         inline fn parent(self: *Self) *Parent {
@@ -154,7 +156,7 @@ pub fn Connection(
             errdefer self.allocator.free(ciphertext);
             const res = try self.tls.encrypt(cleartext, ciphertext);
             self.tcp.send(res.ciphertext);
-            self.tcp.recvInto(self.recv_buf[self.recv_tail..]);
+            self.tcp.recv();
         }
 
         fn onTcpSend(self: *Self, ciphertext: []const u8) !void {
@@ -162,23 +164,19 @@ pub fn Connection(
         }
 
         fn onTcpRecv(self: *Self, data: []u8) !void {
-            self.recv_tail += data.len;
-            try self.decrypt();
-            self.tcp.recvInto(self.recv_buf[self.recv_tail..]);
-        }
+            const ciphertext = try self.recv_buf.append(self.allocator, data);
 
-        fn decrypt(self: *Self) !void {
-            const res = try self.tls.decrypt(self.recv_buf[0..self.recv_tail], &self.recv_buf);
+            const res = try self.tls.decrypt(ciphertext, ciphertext);
             if (res.cleartext.len > 0) {
                 try onRecv(self.parent(), res.cleartext);
             }
+            try self.recv_buf.set(self.allocator, res.unused_ciphertext);
 
-            if (res.unused_ciphertext.len == 0) {
-                self.recv_tail = 0;
-            } else if (res.unused_ciphertext.len > 0) {
-                @memmove(self.recv_buf[0..res.unused_ciphertext.len], res.unused_ciphertext);
-                self.recv_tail = res.unused_ciphertext.len;
-            }
+            self.tcp.recv();
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.recv_buf.deinit(self.allocator);
         }
 
         pub fn close(self: *Self) !void {
@@ -209,8 +207,8 @@ test "sizeOf" {
         fn onClose(_: *Self, _: anyerror) void {}
     };
 
-    try std.testing.expectEqual(84544, @sizeOf(Client));
+    try std.testing.expectEqual(67904, @sizeOf(Client));
     try std.testing.expectEqual(67584, @sizeOf(Connector(Client, "connector", Client.onConnect)));
-    try std.testing.expectEqual(16960, @sizeOf(Connection(Client, "conn", Client.onRecv, Client.onClose)));
+    try std.testing.expectEqual(312, @sizeOf(Connection(Client, "conn", Client.onRecv, Client.onClose)));
     //std.debug.print("Client: {}\n", .{@sizeOf(Client)});
 }

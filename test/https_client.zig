@@ -30,6 +30,7 @@ pub fn main() !void {
         .fd_nr = 32,
     });
     defer loop.deinit();
+    _ = try loop.addBufferGroup(4096, 1);
 
     var cli: Client = .init(gpa, &loop, addr, config, host);
     cli.connect();
@@ -80,11 +81,7 @@ const Client = struct {
         tls_conn: tls.nonblock.Connection,
         recv_buf: []const u8,
     ) !void {
-        self.conn = .init(self.allocator, self.loop, fd, tls_conn);
-        if (recv_buf.len > 0) {
-            @memcpy(self.conn.recv_buf[0..recv_buf.len], recv_buf);
-            self.conn.recv_tail = recv_buf.len;
-        }
+        self.conn = try .init(self.allocator, self.loop, fd, tls_conn, recv_buf);
         try self.get(self.host);
     }
 
@@ -94,8 +91,8 @@ const Client = struct {
         try self.conn.send(request);
     }
 
-    fn onRecv(_: *Self, data: []const u8) !void {
-        std.debug.print("{s}", .{data});
+    fn onRecv(self: *Self, data: []const u8) !void {
+        std.debug.print("onRecv: {} recv_buf.len: {}\n", .{ data.len, self.conn.recv_buf.buffer.len });
     }
 
     fn onClose(_: *Self, _: anyerror) void {}
