@@ -86,6 +86,7 @@ pub fn deinit(self: *Loop) void {
     self.ring.deinit();
 }
 
+/// Waits for nr retquest to be completed.
 pub fn tickNr(self: *Loop, wait_nr: u32) !void {
     _ = try self.ring.submit_and_wait(wait_nr);
     self.processCompletions();
@@ -141,8 +142,7 @@ pub fn runFor(self: *Loop, ms: u64) !void {
         try self.tickTimer(&self.tick_timer_ts.?);
     }
     while (self.tick_timer_ts != null) {
-        _ = try self.ring.submit_and_wait(1);
-        self.processCompletions();
+        try self.tickNr(1);
     }
 }
 
@@ -467,7 +467,7 @@ pub fn close(self: *Loop, fd: linux.fd_t) SubmitError!void {
     sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
     // cancel any fd operations
     sqe = self.ring.get_sqe() catch unreachable;
-    sqe.prep_cancel_fd(fd, 0);
+    sqe.prep_cancel_fd(fd, linux.IORING_ASYNC_CANCEL_FD_FIXED);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
     sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
     sqe.user_data = no_user_data;
@@ -477,6 +477,12 @@ pub fn close(self: *Loop, fd: linux.fd_t) SubmitError!void {
 pub fn cancel(self: *Loop, idx: usize) SubmitError!void {
     try self.ensureSqCapacity(1);
     var sqe = self.ring.cancel(no_user_data, idx, 0) catch unreachable;
+    sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
+}
+
+pub fn cancelAll(self: *Loop) SubmitError!void {
+    try self.ensureSqCapacity(1);
+    var sqe = self.ring.cancel(no_user_data, 0, linux.IORING_ASYNC_CANCEL_ALL | linux.IORING_ASYNC_CANCEL_ANY) catch unreachable;
     sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
 }
 

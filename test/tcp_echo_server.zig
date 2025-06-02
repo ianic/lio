@@ -4,11 +4,14 @@ const linux = std.os.linux;
 const posix = std.posix;
 const io = @import("lio");
 const mem = std.mem;
+const signal = @import("signal.zig");
 
 const log = std.log.scoped(.main);
 pub const std_options = std.Options{ .log_level = .debug };
 
 pub fn main() !void {
+    signal.setHandler();
+
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
     defer _ = debug_allocator.deinit();
     const gpa = debug_allocator.allocator();
@@ -16,6 +19,7 @@ pub fn main() !void {
     var loop = try io.Loop.init(gpa, .{
         .entries = 4096,
         .fd_nr = 1024,
+        .flags = 0, //linux.IORING_SETUP_SINGLE_ISSUER, //| linux.IORING_SETUP_SQPOLL,
     });
     defer loop.deinit();
 
@@ -30,23 +34,29 @@ pub fn main() !void {
     var prev_metric = loop.metric;
     var i: usize = 1;
     while (true) : (i +%= 1) {
-        try loop.runFor(1000);
+        loop.runFor(1000) catch |err| switch (err) {
+            error.SignalInterrupt => {},
+            else => return err,
+        };
+        if (signal.get()) |sig| switch (sig) {
+            posix.SIG.TERM, posix.SIG.INT => break,
+            else => {},
+        };
+
         log.debug("run: {} bytes: {} MB: {} ops: {} active: {}", .{
             i,
-            total_bytes,
-            total_bytes / 1000_000,
+            listener.total_bytes,
+            listener.total_bytes / 1000_000,
             loop.metric.processed_op -% prev_metric.processed_op,
             loop.metric.active_op,
         });
-        total_bytes = 0;
+        listener.total_bytes = 0;
         prev_metric = loop.metric;
     }
 
-    try listener.close();
-    try loop.drain();
+    log.debug("deinit", .{});
+    listener.deinit();
 }
-
-var total_bytes: usize = 0;
 
 const Listener = struct {
     const Self = @This();
@@ -54,21 +64,33 @@ const Listener = struct {
     allocator: mem.Allocator,
     loop: *io.Loop,
     tcp: io.tcp.Listener(Self, "tcp", onAccept, onError),
+    total_bytes: usize = 0,
+    connections: std.AutoArrayHashMapUnmanaged(*Connection, void) = .empty,
 
     fn onAccept(self: *Self, fd: posix.fd_t) anyerror!void {
+        try self.connections.ensureUnusedCapacity(self.allocator, 1);
         const conn = try self.allocator.create(Connection);
         errdefer self.allocator.destroy(conn);
         conn.* = .init(self, fd);
+        self.connections.putAssumeCapacity(conn, {});
         conn.recv();
     }
 
-    fn onError(self: *Self, err: anyerror) void {
-        log.err("listener {}", .{err});
-        self.tcp.listen();
+    fn onError(_: *Self, err: anyerror) void {
+        log.err("tcp listener error {}", .{err});
+        // self.tcp.listen();
     }
 
     fn destroy(self: *Self, conn: *Connection) void {
+        assert(self.connections.fetchSwapRemove(conn) != null);
         self.allocator.destroy(conn);
+    }
+
+    fn deinit(self: *Self) void {
+        for (self.connections.keys()) |conn| {
+            self.allocator.destroy(conn);
+        }
+        self.connections.deinit(self.allocator);
     }
 };
 
@@ -94,7 +116,7 @@ const Connection = struct {
 
     fn onRecv(self: *Self, data: []u8) !void {
         const n: u32 = @intCast(data.len);
-        total_bytes += n;
+        self.listener.total_bytes += n;
         self.recv_bytes = n;
         self.tcp.send(self.buffer[0..self.recv_bytes]);
     }
@@ -103,7 +125,8 @@ const Connection = struct {
         self.recv();
     }
 
-    fn onClose(self: *Self, _: anyerror) void {
+    fn onClose(self: *Self, err: anyerror) void {
+        log.err("connection close {}", .{err});
         self.listener.destroy(self);
     }
 };

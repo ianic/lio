@@ -190,10 +190,10 @@ pub fn Connection(
         loop: *io.Loop,
         fd: linux.fd_t = -1,
         buffer_group_id: u16 = 0,
+        // Operation references used for cancelation on close
         send_op: ?u32 = null,
         recv_op: ?u32 = null,
-
-        // Remember used buffer so we can repeat operation on interrupt
+        // Remember send/recv buffer so we can repeat operation on interrupt
         recv_buffer: []u8 = &.{},
         send_buffer: []const u8 = &.{},
         send_len: usize = 0,
@@ -237,7 +237,7 @@ pub fn Connection(
                 };
             } else |err| switch (err) {
                 error.InterruptedSystemCall => self.sendSubmit(),
-                error.OperationCanceled => unreachable,
+                //error.OperationCanceled => unreachable,
                 else => self.handleError(err),
             }
         }
@@ -259,7 +259,7 @@ pub fn Connection(
                 };
             } else |err| switch (err) {
                 error.InterruptedSystemCall => self.recvInto(self.recv_buffer),
-                error.OperationCanceled => unreachable,
+                // error.OperationCanceled => unreachable,
                 else => self.handleError(err),
             }
         }
@@ -286,7 +286,7 @@ pub fn Connection(
                 };
             } else |err| switch (err) {
                 error.NoBufferSpaceAvailable, error.InterruptedSystemCall => self.recv(),
-                error.OperationCanceled => unreachable,
+                //error.OperationCanceled => unreachable,
                 else => self.handleError(err),
             }
         }
