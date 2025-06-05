@@ -26,18 +26,19 @@ pub const Options = struct {
 pub const Op = struct {
     const Callback = *const fn (*Loop, Op, linux.io_uring_cqe) void;
 
+    /// If null operations if free, not used.
+    /// If not null holds pointer to operation index in op_list.
     ref: ?*?u32 = null,
+    /// If null operation is detached, there is no handler waiting for completion.
+    /// If not null holds completion callback.
     callback: ?Callback = null,
+
     args: union(enum) {
         recv: struct { buffer_group_id: u16 },
-        // recv: union(enum) {
-        //     buffer_group_id: u16,
-        //     buffer: []u8,
-        // },
-        // send: []const u8,
+        timer: timespec,
     } = undefined,
 
-    /// Break connection with parent, replace callback with noop callback.
+    /// Break connection with completion handler.
     fn detach(self: *Op) void {
         // Clear parent reference to the operation
         if (self.ref) |ref| ref.* = null;
@@ -46,15 +47,21 @@ pub const Op = struct {
 };
 
 const Loop = @This();
-const yes_value: u32 = 1;
-const yes_socket_option = std.mem.asBytes(&yes_value);
+const timespec = linux.kernel_timespec;
+const yes_socket_option = std.mem.asBytes(&@as(u32, 1));
 const no_user_data: u64 = std.math.maxInt(u64);
-const timer_user_data: u64 = no_user_data - 1;
+const tick_timer_user_data: u64 = no_user_data - 1;
+const timers_user_data: u64 = no_user_data - 2;
 
 allocator: mem.Allocator,
 ring: linux.IoUring,
-op_list: std.ArrayList(Op),
-next_free_op: usize = 0,
+op_pool: ArrayPool(Op),
+buffer_groups: std.ArrayListUnmanaged(linux.IoUring.BufferGroup) = .empty,
+tick_timer_ts: ?timespec = null,
+now: timespec = .{ .sec = 0, .nsec = 0 },
+timers_pq: std.PriorityQueue(u32, *Loop, timersCompare),
+timers_fire_ts: ?timespec = null,
+
 metric: struct {
     /// Current number of in kernel operations
     active_op: usize = 0,
@@ -65,8 +72,19 @@ metric: struct {
     /// Total number of receive operations failed with no buffer available
     recv_no_buffer: usize = 0,
 } = .{},
-tick_timer_ts: ?linux.kernel_timespec = null,
-buffer_groups: std.ArrayListUnmanaged(linux.IoUring.BufferGroup) = .empty,
+
+fn timersCompare(loop: *Loop, a_idx: u32, b_idx: u32) std.math.Order {
+    return tsCompare(
+        loop.op_pool.get(a_idx).args.timer,
+        loop.op_pool.get(b_idx).args.timer,
+    );
+}
+
+fn tsCompare(a_ts: anytype, b_ts: anytype) std.math.Order {
+    if (a_ts.sec == b_ts.sec)
+        return std.math.order(a_ts.nsec, b_ts.nsec);
+    return std.math.order(a_ts.sec, b_ts.sec);
+}
 
 pub fn init(allocator: mem.Allocator, opt: Options) !Loop {
     var ring = try linux.IoUring.init(opt.entries, opt.flags);
@@ -75,25 +93,30 @@ pub fn init(allocator: mem.Allocator, opt: Options) !Loop {
     return .{
         .allocator = allocator,
         .ring = ring,
-        .op_list = try .initCapacity(allocator, @min(16, opt.fd_nr)),
+        .op_pool = try .init(allocator, @min(16, opt.fd_nr)),
+        .timers_pq = .init(allocator, undefined),
     };
 }
 
 pub fn deinit(self: *Loop) void {
     for (self.buffer_groups.items) |*bg| bg.deinit(self.allocator);
     self.buffer_groups.deinit(self.allocator);
-    self.op_list.deinit();
+    self.op_pool.deinit();
+    self.timers_pq.deinit();
     self.ring.deinit();
 }
 
 /// Waits for nr retquest to be completed.
 pub fn tickNr(self: *Loop, wait_nr: u32) !void {
+    try self.submitTimers();
     _ = try self.ring.submit_and_wait(wait_nr);
     self.processCompletions();
 }
 
 /// Get completions and call operation callback for each completion.
 fn processCompletions(self: *Loop) void {
+    self.getTime();
+
     var ring = &self.ring;
     // Repeat in the case of overlapping ring
     while (true) {
@@ -109,18 +132,18 @@ fn processCompletions(self: *Loop) void {
                 // cqe without Op in userdata
                 continue;
             }
-            if (cqe.user_data == timer_user_data) {
+            if (cqe.user_data == tick_timer_user_data) {
                 self.tick_timer_ts = null;
                 continue;
             }
+            if (cqe.user_data == timers_user_data) {
+                self.fireTimers();
+                continue;
+            }
             const idx = cqe.user_data;
-            const op: Op = self.op_list.items[idx];
+            const op: Op = self.op_pool.get(@intCast(idx));
             if (!flagMore(cqe)) {
-                // Done with operation mark it as unused.
-                self.op_list.items[idx] = .{};
-                self.metric.active_op -= 1;
-                self.next_free_op = idx;
-                if (op.callback != null) op.ref.?.* = null;
+                self.freeOp(@intCast(idx));
             }
             if (op.callback) |callback| callback(self, op, cqe);
             self.metric.processed_op +%= 1;
@@ -130,16 +153,22 @@ fn processCompletions(self: *Loop) void {
     }
 }
 
+// Done with operation mark it as unused.
+fn freeOp(self: *Loop, idx: u32) void {
+    const op: *Op = self.op_pool.getPtr(idx);
+    if (op.callback != null) op.ref.?.* = null;
+    self.op_pool.release(idx);
+    self.metric.active_op -= 1;
+}
+
 pub fn tick(self: *Loop) !void {
     return self.tickNr(1);
 }
 
-pub fn runFor(self: *Loop, ms: u64) !void {
+pub fn runFor(self: *Loop, ms: u32) !void {
     if (self.tick_timer_ts == null) {
-        const sec = ms / std.time.ms_per_s;
-        const nsec = (ms - sec * std.time.ms_per_s) * std.time.ns_per_ms;
-        self.tick_timer_ts = .{ .sec = @intCast(sec), .nsec = @intCast(nsec) };
-        try self.tickTimer(&self.tick_timer_ts.?);
+        self.tick_timer_ts = after(.{ .sec = 0, .nsec = 0 }, ms);
+        _ = try self.ring.timeout(tick_timer_user_data, &self.tick_timer_ts.?, 0, 0);
     }
     while (self.tick_timer_ts != null) {
         try self.tickNr(1);
@@ -195,34 +224,12 @@ fn ensureSqCapacity(self: *Loop, count: u32) SubmitError!void {
     }
 }
 
-/// Returns Op and index to that Op in op_list
-fn getOrCreateOp(self: *Loop) error{OutOfMemory}!struct { *Op, usize } {
-    // Find existing free operation
-    {
-        const ops = self.op_list.items;
-        // find unused op with higher index than the last one
-        for (self.next_free_op..ops.len) |idx| {
-            const op = &ops[idx];
-            if (op.ref == null) return .{ op, idx };
-        }
-        // find unused from start of the list
-        for (0..@min(self.next_free_op, ops.len)) |idx| {
-            const op = &ops[idx];
-            if (op.ref == null) return .{ op, idx };
-        }
-    }
-    // Increase operations list
-    try self.op_list.append(.{});
-    const idx = self.op_list.items.len - 1;
-    return .{ &self.op_list.items[idx], idx };
-}
-
 fn prepareOp(
     self: *Loop,
     ref: *?u32,
     callback: Op.Callback,
 ) error{OutOfMemory}!struct { *Op, usize } {
-    const op, const idx = try self.getOrCreateOp();
+    const idx, const op = try self.op_pool.acquire();
     assert(ref.* == null);
     assert(op.ref == null);
     self.metric.active_op += 1;
@@ -320,7 +327,7 @@ pub fn connect(
     parent_field_ptr: *?u32,
     fd: linux.fd_t,
     addr: *std.net.Address,
-    timeout: ?*linux.kernel_timespec,
+    timeout: ?*timespec,
 ) PrepareError!void {
     try self.ensureSqCapacity(2);
     _, const user_data = try self.prepareOp(parent_field_ptr, struct {
@@ -457,6 +464,75 @@ pub fn send(
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 }
 
+pub fn setTimer(
+    self: *Loop,
+    comptime Parent: type,
+    comptime onComplete: fn (*Parent) void,
+    comptime parent_field_name: []const u8,
+    parent_field_ptr: *?u32,
+    delay: u32,
+) PrepareError!void {
+    try self.timers_pq.ensureUnusedCapacity(1);
+    // If already set find it and remove.
+    if (parent_field_ptr.*) |op_idx| self.removeTimer(op_idx);
+
+    var op, const idx = try self.prepareOp(parent_field_ptr, struct {
+        fn callback(_: *Loop, op: Op, cqe: linux.io_uring_cqe) void {
+            success(cqe) catch |err| {
+                log.err("timer complete {}", .{err});
+            };
+            onComplete(@alignCast(@fieldParentPtr(parent_field_name, op.ref.?)));
+        }
+    }.callback);
+    const ts = after(self.now, delay);
+    op.args = .{ .timer = ts };
+    self.timers_pq.add(@intCast(idx)) catch unreachable;
+}
+
+fn removeTimer(self: *Loop, op_idx: u32) void {
+    for (self.timers_pq.items, 0..) |v, i| if (v == op_idx) {
+        _ = self.timers_pq.removeIndex(i);
+        self.freeOp(op_idx);
+        return;
+    };
+}
+
+/// Finds earliest timer and prepares timeout operation for that timestamp.
+fn submitTimers(self: *Loop) !void {
+    const idx = self.timers_pq.peek() orelse return;
+    const ts = self.op_pool.get(idx).args.timer;
+
+    if (self.timers_fire_ts) |fire_ts| {
+        if (tsCompare(ts, fire_ts) == .lt) {
+            // Timer is set and new timestamp is less => cancel current timer.
+            try self.cancel(timers_user_data);
+            self.timers_fire_ts = .{ .sec = 0, .nsec = 0 };
+        }
+        return;
+    }
+    // No timer is set, set this one
+    self.timers_fire_ts = ts;
+    errdefer self.timers_fire_ts = null;
+    _ = try self.ring.timeout(
+        timers_user_data,
+        &self.timers_fire_ts.?,
+        0,
+        linux.IORING_TIMEOUT_ABS | linux.IORING_TIMEOUT_REALTIME,
+    );
+}
+
+/// Fires callbacks for all due timers.
+fn fireTimers(self: *Loop) void {
+    self.timers_fire_ts = null;
+    while (self.timers_pq.peek()) |idx| {
+        const op = self.op_pool.get(idx);
+        if (tsCompare(op.args.timer, self.now) == .gt) return;
+        _ = self.timers_pq.remove();
+        self.freeOp(idx);
+        if (op.callback) |callback| callback(self, op, undefined);
+    }
+}
+
 /// Close file descriptor and cancel any pending operations on that fd.
 pub fn close(self: *Loop, fd: linux.fd_t) SubmitError!void {
     if (fd < 0) return;
@@ -488,16 +564,14 @@ pub fn cancelAll(self: *Loop) SubmitError!void {
 
 /// Detach (don't call callback when completed) single operation by index and
 /// cancel that operation if still active.
-pub fn detach(self: *Loop, idx: usize) !void {
-    const op = &self.op_list.items[idx];
+pub fn detach(self: *Loop, idx: u32) !void {
+    const op = self.op_pool.getPtr(idx);
     assert(op.ref != null);
     op.detach();
-    try self.cancel(idx);
-}
-
-fn tickTimer(self: *Loop, ts: *linux.kernel_timespec) SubmitError!void {
-    try self.ensureSqCapacity(1);
-    _ = self.ring.timeout(timer_user_data, ts, 0, 0) catch unreachable;
+    switch (op.args) {
+        .timer => self.removeTimer(@intCast(idx)),
+        else => try self.cancel(idx),
+    }
 }
 
 pub fn addBufferGroup(
@@ -619,7 +693,7 @@ test "ensure ensureSqCapacity pushes sqes to the kernel" {
 
 test "OutOfMemory on operations list unable to grow" {
     const ops_count = 8;
-    var buf: [ops_count * @sizeOf(Op)]u8 = undefined;
+    var buf: [ops_count * @sizeOf(Op) + ops_count * @sizeOf(u32)]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
     var loop = try Loop.init(fba.allocator(), .{
         .entries = 2,
@@ -646,12 +720,12 @@ test "OutOfMemory on operations list unable to grow" {
     const domain = linux.AF.INET;
     const socket_type = linux.SOCK.STREAM;
 
-    try testing.expectEqual(ops_count, loop.op_list.capacity);
+    try testing.expectEqual(ops_count, loop.op_pool.list.capacity);
     for (0..ops_count) |_| {
         try loop.socket(Ctx, Ctx.onSocket, "op", &ctx.op, domain, socket_type);
         ctx.op = null;
     }
-    try testing.expectEqual(ops_count, loop.op_list.items.len);
+    try testing.expectEqual(ops_count, loop.op_pool.list.items.len);
     loop.socket(Ctx, Ctx.onSocket, "op", &ctx.op, domain, socket_type) catch |err| switch (err) {
         error.OutOfMemory => return,
         else => unreachable,
@@ -774,5 +848,186 @@ fn testSend(addr: std.net.Address) void {
 }
 
 test "size" {
-    try testing.expectEqual(24, @sizeOf(Op));
+    try testing.expectEqual(40, @sizeOf(Op));
+}
+
+fn getTime(self: *Loop) void {
+    const ts = std.posix.clock_gettime(.REALTIME) catch |err| switch (err) {
+        error.UnsupportedClock => unreachable,
+        error.Unexpected => {
+            log.err("clock_gettime: {}", .{err});
+            return;
+        },
+    };
+    self.now = .{ .sec = ts.sec, .nsec = ts.nsec };
+}
+
+fn after(ts: timespec, ms: u32) timespec {
+    var nsec: i64 = ts.nsec + ms * std.time.ns_per_ms;
+    var sec: i64 = ts.sec;
+    if (nsec >= std.time.ns_per_s) {
+        sec += @divFloor(nsec, std.time.ns_per_s);
+        nsec = @mod(nsec, std.time.ns_per_s);
+    }
+    return .{ .sec = sec, .nsec = nsec };
+}
+
+test "after" {
+    var a = after(.{ .sec = 0, .nsec = 0 }, 1000);
+    try testing.expectEqual(1, a.sec);
+    try testing.expectEqual(0, a.nsec);
+
+    a = after(.{ .sec = 0, .nsec = 1 }, 1000);
+    try testing.expectEqual(1, a.sec);
+    try testing.expectEqual(1, a.nsec);
+
+    a = after(.{ .sec = 0, .nsec = 1 }, 1998);
+    try testing.expectEqual(1, a.sec);
+    try testing.expectEqual(998000001, a.nsec);
+}
+
+test "timers" {
+    const T = struct {
+        const Self = @This();
+        op1: ?u32 = null,
+        op2: ?u32 = null,
+
+        call_count: usize = 0,
+        fn onTimer(self: *Self) void {
+            self.call_count += 1;
+        }
+    };
+
+    var loop = try Loop.init(testing.allocator, .{
+        .entries = 4,
+        .fd_nr = 2,
+    });
+    defer loop.deinit();
+    loop.timers_pq.context = &loop;
+    loop.getTime();
+
+    var t: T = .{};
+    {
+        try loop.setTimer(T, T.onTimer, "op1", &t.op1, 30);
+        try loop.setTimer(T, T.onTimer, "op2", &t.op2, 20);
+
+        try testing.expectEqual(2, loop.timers_pq.count());
+        try testing.expectEqual(0, t.op1.?);
+        try testing.expectEqual(1, t.op2.?);
+
+        try loop.tickNr(1);
+        try testing.expectEqual(1, t.call_count);
+        try testing.expectEqual(1, loop.timers_pq.count());
+        try loop.tickNr(1);
+        try testing.expectEqual(2, t.call_count);
+        try testing.expectEqual(0, loop.timers_pq.count());
+    }
+    { // cancel previous longer timer
+        t.call_count = 0;
+        try loop.setTimer(T, T.onTimer, "op1", &t.op1, 30);
+        try testing.expect(t.op1 != null);
+        try loop.submitTimers();
+        // set shorter timer while longer is submitted
+        try loop.setTimer(T, T.onTimer, "op2", &t.op2, 20);
+        try testing.expect(t.op2 != null);
+
+        try loop.tickNr(1); // cancel operation
+        try testing.expectEqual(0, t.call_count);
+        try loop.tickNr(1); // op2 is fired
+        try testing.expect(t.op2 == null);
+        try testing.expect(t.op1 != null);
+        try testing.expectEqual(1, t.call_count);
+        try loop.tickNr(1);
+        try testing.expect(t.op1 == null);
+    }
+    { // reset same timer to the new value
+        t.call_count = 0;
+        try loop.setTimer(T, T.onTimer, "op1", &t.op1, 20);
+        try testing.expectEqual(1, loop.timers_pq.count());
+        const ts1 = loop.op_pool.get(loop.timers_pq.peek().?).args.timer;
+        try testing.expectEqual(1, loop.metric.active_op);
+        try loop.setTimer(T, T.onTimer, "op1", &t.op1, 30);
+        try testing.expectEqual(1, loop.timers_pq.count());
+        const ts2 = loop.op_pool.get(loop.timers_pq.peek().?).args.timer;
+        try testing.expect(tsCompare(ts1, ts2) == .lt);
+        try testing.expectEqual(1, loop.metric.active_op);
+    }
+
+    { // detached
+        try testing.expect(t.op1 != null);
+        try testing.expectEqual(1, loop.timers_pq.count());
+        try loop.detach(t.op1.?);
+        try testing.expect(t.op1 == null);
+        try testing.expectEqual(0, loop.timers_pq.count());
+    }
+}
+
+fn ArrayPool(T: type) type {
+    return struct {
+        const Self = @This();
+
+        list: std.ArrayList(T),
+        free: std.ArrayList(u32),
+
+        pub fn init(allocator: mem.Allocator, num: usize) !Self {
+            return .{
+                .list = try std.ArrayList(T).initCapacity(allocator, num),
+                .free = try std.ArrayList(u32).initCapacity(allocator, num),
+            };
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.free.deinit();
+            self.list.deinit();
+        }
+
+        pub fn acquire(self: *Self) !struct { u32, *T } {
+            if (self.free.pop()) |idx| {
+                return .{ @intCast(idx), &self.list.items[idx] };
+            }
+            try self.list.append(.{});
+            try self.free.ensureTotalCapacityPrecise(self.list.capacity);
+            const idx = self.list.items.len - 1;
+            return .{ @intCast(idx), &self.list.items[idx] };
+        }
+
+        pub fn release(self: *Self, idx: u32) void {
+            self.free.appendAssumeCapacity(idx);
+            self.list.items[idx] = .{};
+        }
+
+        pub fn get(self: *Self, idx: u32) T {
+            return self.list.items[idx];
+        }
+
+        pub fn getPtr(self: *Self, idx: u32) *T {
+            return &self.list.items[idx];
+        }
+    };
+}
+
+test "ArrayPool" {
+    const T = struct {
+        val: usize = 0,
+    };
+
+    var pool = try ArrayPool(T).init(testing.allocator, 2);
+    defer pool.deinit();
+    try testing.expectEqual(0, pool.list.items.len);
+    try testing.expectEqual(2, pool.free.capacity);
+    try testing.expectEqual(2, pool.list.capacity);
+    try testing.expectEqual(0, (try pool.acquire())[0]);
+    try testing.expectEqual(2, pool.list.capacity);
+    try testing.expectEqual(1, (try pool.acquire())[0]);
+    try testing.expectEqual(2, pool.list.capacity);
+    try testing.expectEqual(2, (try pool.acquire())[0]);
+    try testing.expect(pool.list.capacity > 2);
+    try testing.expectEqual(pool.list.capacity, pool.free.capacity);
+    try testing.expectEqual(0, pool.free.items.len);
+    pool.release(2);
+    pool.release(1);
+    try testing.expectEqual(2, pool.free.items.len);
+    try testing.expectEqual(2, pool.free.items.len);
+    try testing.expectEqual(1, (try pool.acquire())[0]);
+    try testing.expectEqual(1, pool.free.items.len);
 }

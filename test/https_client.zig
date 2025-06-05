@@ -14,7 +14,8 @@ pub fn main() !void {
     defer _ = debug_allocator.deinit();
     const gpa = debug_allocator.allocator();
 
-    const host = "www.google.com";
+    //const host = "www.google.com";
+    const host = "www.monitor.hr";
     const addr = try getAddress(gpa, host, 443);
 
     // tls config
@@ -32,7 +33,7 @@ pub fn main() !void {
     defer loop.deinit();
     _ = try loop.addBufferGroup(4096, 1);
 
-    var cli: Client = .init(gpa, &loop, addr, config, host);
+    var cli = try Client.init(gpa, &loop, addr, config, host);
     cli.connect();
 
     while (true)
@@ -48,10 +49,11 @@ fn getAddress(allocator: mem.Allocator, host: []const u8, port: u16) !net.Addres
 
 const Client = struct {
     const Self = @This();
+    const Connector = io.tls.Connector(Self, onConnect, onConnectError);
 
     allocator: mem.Allocator,
     loop: *io.Loop,
-    connector: io.tls.Connector(Self, "connector", onConnect),
+    connector: *Connector,
     conn: io.tls.Connection(Self, "conn", onRecv, onClose),
     host: []const u8,
 
@@ -61,18 +63,20 @@ const Client = struct {
         addr: net.Address,
         config: tls.config.Client,
         host: []const u8,
-    ) Self {
+    ) !Self {
+        const connector = try allocator.create(Connector);
+        connector.* = .init(loop, addr, config);
         return .{
             .allocator = allocator,
             .loop = loop,
-            .connector = .init(loop, addr, config),
+            .connector = connector,
             .host = host,
             .conn = undefined,
         };
     }
 
     pub fn connect(self: *Self) void {
-        self.connector.connect();
+        self.connector.connect(self);
     }
 
     fn onConnect(
@@ -83,6 +87,7 @@ const Client = struct {
     ) !void {
         self.conn = try .init(self.allocator, self.loop, fd, tls_conn, recv_buf);
         try self.get(self.host);
+        self.allocator.destroy(self.connector);
     }
 
     fn get(self: *Self, host: []const u8) !void {
@@ -95,5 +100,13 @@ const Client = struct {
         std.debug.print("onRecv: {} recv_buf.len: {}\n", .{ data.len, self.conn.recv_buf.buffer.len });
     }
 
-    fn onClose(_: *Self, _: anyerror) void {}
+    fn onClose(_: *Self, err: anyerror) void {
+        log.debug("connection close {}", .{err});
+    }
+
+    fn onConnectError(self: *Self, err: anyerror) void {
+        self.allocator.destroy(self.connector);
+        log.err("connect error {}", .{err});
+        unreachable;
+    }
 };

@@ -11,8 +11,8 @@ const log = std.log.scoped(.tls);
 
 pub fn Connector(
     comptime Parent: type,
-    comptime parent_field_name: []const u8,
     comptime onConnect: *const fn (*Parent, linux.fd_t, tls.nonblock.Connection, []const u8) anyerror!void,
+    comptime onError: *const fn (*Parent, err: anyerror) void,
 ) type {
     return struct {
         const Self = @This();
@@ -25,10 +25,7 @@ pub fn Connector(
         recv_buf: [tls.max_ciphertext_record_len]u8 = undefined,
         recv_tail: usize = 0,
         send_buf: [tls.max_ciphertext_record_len]u8 = undefined,
-
-        inline fn parent(self: *Self) *Parent {
-            return @alignCast(@fieldParentPtr(parent_field_name, self));
-        }
+        parent: *Parent = undefined,
 
         pub fn init(
             loop: *io.Loop,
@@ -42,7 +39,8 @@ pub fn Connector(
             };
         }
 
-        pub fn connect(self: *Self) void {
+        pub fn connect(self: *Self, parent: *Parent) void {
+            self.parent = parent;
             self.tcp_connector.connect();
         }
 
@@ -70,7 +68,7 @@ pub fn Connector(
             }
             if (self.tls_handshake.done()) {
                 onConnect(
-                    self.parent(),
+                    self.parent,
                     self.tcp_conn.fd,
                     tls.nonblock.Connection.init(self.tls_handshake.cipher().?),
                     self.recv_buf[0..self.recv_tail],
@@ -91,27 +89,18 @@ pub fn Connector(
         }
 
         fn onTcpConnectError(self: *Self, err: anyerror) void {
-            _ = self;
-            _ = err catch unreachable;
-            // if (io.tcp.isNetworkError(err)) {
-            //     log.debug("reconnect {}", .{err});
-            //     return self.tcp.connect();
-            // }
-            // log.err("connector {}", .{err});
+            self.handleError(err);
         }
 
         fn onClose(self: *Self, err: anyerror) void {
-            if (err == error.EndOfFile) {
-                self.handshake();
-            } else {
-                unreachable;
-            }
+            if (err == error.EndOfFile) return self.handshake();
+            self.handleError(err);
         }
 
         fn handleError(self: *Self, err: anyerror) void {
             self.tcp_connector.close() catch {};
             self.tcp_conn.close() catch {};
-            _ = err catch unreachable;
+            onError(self.parent, err);
         }
     };
 }
@@ -193,22 +182,15 @@ test "sizeOf" {
     const Client = struct {
         const Self = @This();
 
-        connector: io.tls.Connector(Self, "connector", onConnect),
+        connector: *io.tls.Connector(Self, onConnect, onClose),
         conn: io.tls.Connection(Self, "conn", onRecv, onClose),
 
-        fn onConnect(
-            _: *Self,
-            _: linux.fd_t,
-            _: tls.nonblock.Connection,
-            _: []const u8,
-        ) !void {}
-
+        fn onConnect(_: *Self, _: linux.fd_t, _: tls.nonblock.Connection, _: []const u8) !void {}
         fn onRecv(_: *Self, _: []const u8) !void {}
         fn onClose(_: *Self, _: anyerror) void {}
     };
 
-    try std.testing.expectEqual(67904, @sizeOf(Client));
-    try std.testing.expectEqual(67584, @sizeOf(Connector(Client, "connector", Client.onConnect)));
+    try std.testing.expectEqual(320, @sizeOf(Client));
+    try std.testing.expectEqual(67584, @sizeOf(Connector(Client, Client.onConnect, Client.onClose)));
     try std.testing.expectEqual(312, @sizeOf(Connection(Client, "conn", Client.onRecv, Client.onClose)));
-    //std.debug.print("Client: {}\n", .{@sizeOf(Client)});
 }

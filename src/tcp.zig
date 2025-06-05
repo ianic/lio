@@ -308,3 +308,25 @@ pub fn Connection(
         }
     };
 }
+
+test "sizeOf" {
+    const Client = struct {
+        const Self = @This();
+
+        connector: Connector(Self, "connector", onConnect, onConnectError),
+        conn: Connection(Self, "conn", onRecv, onSend, onClose),
+
+        fn onConnect(_: *Self, _: linux.fd_t) !void {}
+        fn onConnectError(_: *Self, _: anyerror) void {}
+        fn onSend(_: *Self, _: []const u8) !void {}
+        fn onRecv(_: *Self, _: []u8) !void {}
+        fn onClose(_: *Self, _: anyerror) void {}
+    };
+
+    try std.testing.expectEqual(224, @sizeOf(Client));
+    try std.testing.expectEqual(152, @sizeOf(Connector(Client, "connector", Client.onConnect, Client.onConnectError)));
+    try std.testing.expectEqual(72, @sizeOf(Connection(Client, "conn", Client.onRecv, Client.onSend, Client.onClose)));
+
+    try std.testing.expectEqual(112, @sizeOf(std.net.Address));
+    try std.testing.expectEqual(16, @sizeOf(linux.kernel_timespec));
+}
