@@ -4,7 +4,7 @@ const linux = std.os.linux;
 const mem = std.mem;
 const testing = std.testing;
 const log = std.log.scoped(.loop);
-
+const timespec = linux.kernel_timespec;
 const SyscallError = @import("errno.zig").Error;
 
 fn success(cqe: linux.io_uring_cqe) SyscallError!void {
@@ -35,7 +35,7 @@ pub const Op = struct {
 
     args: union(enum) {
         recv: struct { buffer_group_id: u16 },
-        timer: timespec,
+        timer: Timestamp,
     } = undefined,
 
     /// Break connection with completion handler.
@@ -47,7 +47,6 @@ pub const Op = struct {
 };
 
 const Loop = @This();
-const timespec = linux.kernel_timespec;
 const yes_socket_option = std.mem.asBytes(&@as(u32, 1));
 // Reserved values for user_data
 const rsv_user_data = struct {
@@ -61,7 +60,7 @@ ring: linux.IoUring,
 op_pool: ArrayPool(Op),
 buffer_groups: std.ArrayListUnmanaged(linux.IoUring.BufferGroup) = .empty,
 tick_timer_ts: ?timespec = null,
-now: timespec = .{ .sec = 0, .nsec = 0 },
+now: Timestamp = .{},
 timers_pq: std.PriorityQueue(u32, *Loop, timersCompare),
 timers_fire_ts: ?timespec = null,
 
@@ -80,14 +79,13 @@ pub fn init(allocator: mem.Allocator, opt: Options) !Loop {
     var ring = try linux.IoUring.init(opt.entries, opt.flags);
     errdefer ring.deinit();
     try ring.register_files_sparse(opt.fd_nr);
-    var loop = Loop{
+    return .{
         .allocator = allocator,
         .ring = ring,
         .op_pool = try .init(allocator, @min(16, opt.fd_nr)),
         .timers_pq = .init(allocator, undefined), // TODO missing stable pointer to init
+        .now = Timestamp.fromSystem(),
     };
-    loop.getTime();
-    return loop;
 }
 
 pub fn deinit(self: *Loop) void {
@@ -107,7 +105,7 @@ pub fn tickNr(self: *Loop, wait_nr: u32) !void {
 
 /// Get completions and call operation callback for each completion.
 fn processCompletions(self: *Loop) void {
-    self.getTime();
+    self.now = Timestamp.fromSystem();
     var ring = &self.ring;
     // Repeat in the case of overlapping ring
     while (true) {
@@ -149,7 +147,7 @@ pub fn tick(self: *Loop) !void {
 
 pub fn runFor(self: *Loop, ms: u32) !void {
     if (self.tick_timer_ts == null) {
-        self.tick_timer_ts = after(.{ .sec = 0, .nsec = 0 }, ms);
+        self.tick_timer_ts = Timestamp.zero.after(ms).toLinux();
         _ = try self.ring.timeout(rsv_user_data.tick_timer, &self.tick_timer_ts.?, 0, 0);
     }
     while (self.tick_timer_ts != null) {
@@ -530,8 +528,7 @@ pub fn setTimer(
             onComplete(@alignCast(@fieldParentPtr(parent_field_name, op.ref.?)));
         }
     }.callback);
-    const ts = after(self.now, delay);
-    op.args = .{ .timer = ts };
+    op.args = .{ .timer = self.now.after(delay) };
     self.timers_pq.add(@intCast(idx)) catch unreachable;
 }
 
@@ -548,8 +545,9 @@ fn submitTimers(self: *Loop) !void {
     const idx = self.timers_pq.peek() orelse return;
     const ts = self.op_pool.get(idx).args.timer;
 
-    if (self.timers_fire_ts) |fire_ts| {
-        if (tsCompare(ts, fire_ts) == .lt) {
+    if (self.timers_fire_ts) |tc| {
+        const fire_ts = Timestamp.fromLinux(tc);
+        if (ts.compare(fire_ts) == .lt) {
             // Timer is set and new timestamp is less => cancel current timer.
             try self.cancel(rsv_user_data.timers);
             self.timers_fire_ts = .{ .sec = 0, .nsec = 0 };
@@ -557,7 +555,7 @@ fn submitTimers(self: *Loop) !void {
         return;
     }
     // No timer is set, set this one
-    self.timers_fire_ts = ts;
+    self.timers_fire_ts = ts.toLinux();
     errdefer self.timers_fire_ts = null;
     _ = try self.ring.timeout(
         rsv_user_data.timers,
@@ -572,7 +570,7 @@ fn fireTimers(self: *Loop) void {
     self.timers_fire_ts = null;
     while (self.timers_pq.peek()) |idx| {
         const op = self.op_pool.get(idx);
-        if (tsCompare(op.args.timer, self.now) == .gt) return;
+        if (op.args.timer.compare(self.now) == .gt) return;
         _ = self.timers_pq.remove();
         self.releaseOp(idx);
         if (op.callback) |callback| callback(self, op, undefined);
@@ -580,51 +578,9 @@ fn fireTimers(self: *Loop) void {
 }
 
 fn timersCompare(loop: *Loop, a_idx: u32, b_idx: u32) std.math.Order {
-    return tsCompare(
-        loop.op_pool.get(a_idx).args.timer,
-        loop.op_pool.get(b_idx).args.timer,
-    );
-}
-
-fn tsCompare(a_ts: timespec, b_ts: timespec) std.math.Order {
-    if (a_ts.sec == b_ts.sec)
-        return std.math.order(a_ts.nsec, b_ts.nsec);
-    return std.math.order(a_ts.sec, b_ts.sec);
-}
-
-fn getTime(self: *Loop) void {
-    const ts = std.posix.clock_gettime(.REALTIME) catch |err| switch (err) {
-        error.UnsupportedClock => unreachable,
-        error.Unexpected => {
-            log.err("clock_gettime: {}", .{err});
-            return;
-        },
-    };
-    self.now = .{ .sec = ts.sec, .nsec = ts.nsec };
-}
-
-fn after(ts: timespec, ms: u32) timespec {
-    var nsec: i64 = ts.nsec + @as(i64, ms) * std.time.ns_per_ms;
-    var sec: i64 = ts.sec;
-    if (nsec >= std.time.ns_per_s) {
-        sec += @divFloor(nsec, std.time.ns_per_s);
-        nsec = @mod(nsec, std.time.ns_per_s);
-    }
-    return .{ .sec = sec, .nsec = nsec };
-}
-
-test "after" {
-    var a = after(.{ .sec = 0, .nsec = 0 }, 1000);
-    try testing.expectEqual(1, a.sec);
-    try testing.expectEqual(0, a.nsec);
-
-    a = after(.{ .sec = 0, .nsec = 1 }, 1000);
-    try testing.expectEqual(1, a.sec);
-    try testing.expectEqual(1, a.nsec);
-
-    a = after(.{ .sec = 0, .nsec = 1 }, 1998);
-    try testing.expectEqual(1, a.sec);
-    try testing.expectEqual(998000001, a.nsec);
+    const ts_a = loop.op_pool.get(a_idx).args.timer;
+    const ts_b = loop.op_pool.get(b_idx).args.timer;
+    return ts_a.compare(ts_b);
 }
 
 test "socket" {
@@ -883,7 +839,7 @@ fn testSend(addr: std.net.Address) void {
 }
 
 test "size" {
-    try testing.expectEqual(40, @sizeOf(Op));
+    try testing.expectEqual(32, @sizeOf(Op));
 }
 
 test "timers" {
@@ -947,7 +903,7 @@ test "timers" {
         try loop.setTimer(T, T.onTimer, "op1", &t.op1, 30);
         try testing.expectEqual(1, loop.timers_pq.count());
         const ts2 = loop.op_pool.get(loop.timers_pq.peek().?).args.timer;
-        try testing.expect(tsCompare(ts1, ts2) == .lt);
+        try testing.expect(ts1.compare(ts2) == .lt);
         try testing.expectEqual(1, loop.metric.active_op);
     }
 
@@ -1032,13 +988,18 @@ test "ArrayPool" {
 
 const Timestamp = struct {
     const Self = @This();
+    const zero: Self = .{};
 
     value: u64 = 0,
 
     fn toLinux(self: Self) linux.kernel_timespec {
-        const sec: i64 = @divFloor(self.value, std.time.ns_per_s);
-        const nsec: i64 = @mod(self.value, std.time.ns_per_s);
+        const sec: i64 = @intCast(self.value / std.time.ns_per_s);
+        const nsec: i64 = @intCast(self.value % std.time.ns_per_s);
         return .{ .sec = sec, .nsec = nsec };
+    }
+
+    fn fromLinux(tc: linux.kernel_timespec) Timestamp {
+        return .{ .value = @as(u64, @intCast(tc.sec)) * std.time.ns_per_s + @as(u64, @intCast(tc.nsec)) };
     }
 
     fn fromSystem() Self {
@@ -1055,4 +1016,19 @@ const Timestamp = struct {
     fn after(self: Self, ms: u32) Self {
         return .{ .value = self.value + @as(u64, ms) * std.time.ns_per_ms };
     }
+
+    fn compare(self: Self, other: Self) std.math.Order {
+        return std.math.order(self.value, other.value);
+    }
 };
+
+test "timestam from/to Linux" {
+    const ts = Timestamp.fromSystem();
+    try testing.expectEqual(ts, Timestamp.fromLinux(ts.toLinux()));
+    // std.debug.print("ts: \n{}\n{}\n{}\n{}\n", .{
+    //     ts,
+    //     Timestamp.fromLinux(ts.toLinux()),
+    //     ts.toLinux(),
+    //     try std.posix.clock_gettime(.REALTIME),
+    // });
+}
