@@ -311,7 +311,7 @@ pub fn connect(
     parent_field_ptr: *?u32,
     fd: linux.fd_t,
     addr: *std.net.Address,
-    timeout: ?*timespec,
+    connect_timeout: ?*timespec,
 ) PrepareError!void {
     try self.ensureSqCapacity(2);
     _, const user_data = try self.acquireOp(parent_field_ptr, struct {
@@ -326,7 +326,7 @@ pub fn connect(
 
     var sqe = self.ring.connect(user_data, fd, &addr.any, addr.getOsSockLen()) catch unreachable;
     sqe.flags |= linux.IOSQE_FIXED_FILE;
-    if (timeout) |t| {
+    if (connect_timeout) |t| {
         sqe.flags |= linux.IOSQE_IO_LINK;
         sqe = self.ring.link_timeout(rsv_user_data.skip, t, 0) catch unreachable;
         sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
@@ -500,7 +500,7 @@ pub fn detach(self: *Loop, idx: u32) !void {
     assert(op.ref != null);
     op.detach();
     switch (op.args) {
-        .timer => self.removeTimer(@intCast(idx)),
+        .timer => self.timeoutRemove(@intCast(idx)),
         else => try self.cancel(idx),
     }
 }
@@ -523,18 +523,18 @@ pub fn addBufferGroup(
     return idx;
 }
 
-pub fn setTimer(
+pub fn timeout(
     self: *Loop,
     comptime Parent: type,
     comptime onComplete: fn (*Parent) void,
     comptime parent_field_name: []const u8,
     parent_field_ptr: *?u32,
-    delay: u32,
+    after_ms: u32,
 ) PrepareError!void {
     self.timers_pq.context = self;
     try self.timers_pq.ensureUnusedCapacity(1);
     // If already set find it and remove.
-    if (parent_field_ptr.*) |idx| self.removeTimer(idx);
+    if (parent_field_ptr.*) |idx| self.timeoutRemove(idx);
 
     var op, const idx = try self.acquireOp(parent_field_ptr, struct {
         fn callback(_: *Loop, op: Op, cqe: linux.io_uring_cqe) void {
@@ -544,11 +544,11 @@ pub fn setTimer(
             onComplete(@alignCast(@fieldParentPtr(parent_field_name, op.ref.?)));
         }
     }.callback);
-    op.args = .{ .timer = self.now.after(delay) };
-    self.timers_pq.add(@intCast(idx)) catch unreachable;
+    op.args = .{ .timer = self.now.after(after_ms) };
+    self.timers_pq.add(@intCast(idx)) catch unreachable; // capacity ensured above
 }
 
-pub fn removeTimer(self: *Loop, idx: u32) void {
+pub fn timeoutRemove(self: *Loop, idx: u32) void {
     for (self.timers_pq.items, 0..) |v, i| if (v == idx) {
         _ = self.timers_pq.removeIndex(i);
         self.releaseOp(idx);
@@ -878,8 +878,8 @@ test "timers" {
 
     var t: T = .{};
     {
-        try loop.setTimer(T, T.onTimer, "op1", &t.op1, 30);
-        try loop.setTimer(T, T.onTimer, "op2", &t.op2, 20);
+        try loop.timeout(T, T.onTimer, "op1", &t.op1, 30);
+        try loop.timeout(T, T.onTimer, "op2", &t.op2, 20);
 
         try testing.expectEqual(2, loop.timers_pq.count());
         try testing.expectEqual(0, t.op1.?);
@@ -894,11 +894,11 @@ test "timers" {
     }
     { // cancel previous longer timer
         t.call_count = 0;
-        try loop.setTimer(T, T.onTimer, "op1", &t.op1, 30);
+        try loop.timeout(T, T.onTimer, "op1", &t.op1, 30);
         try testing.expect(t.op1 != null);
         try loop.submitTimers();
         // set shorter timer while longer is submitted
-        try loop.setTimer(T, T.onTimer, "op2", &t.op2, 20);
+        try loop.timeout(T, T.onTimer, "op2", &t.op2, 20);
         try testing.expect(t.op2 != null);
 
         try loop.tickNr(1); // cancel operation
@@ -912,11 +912,11 @@ test "timers" {
     }
     { // reset same timer to the new value
         t.call_count = 0;
-        try loop.setTimer(T, T.onTimer, "op1", &t.op1, 20);
+        try loop.timeout(T, T.onTimer, "op1", &t.op1, 20);
         try testing.expectEqual(1, loop.timers_pq.count());
         const ts1 = loop.op_pool.get(loop.timers_pq.peek().?).args.timer;
         try testing.expectEqual(1, loop.metric.active_op);
-        try loop.setTimer(T, T.onTimer, "op1", &t.op1, 30);
+        try loop.timeout(T, T.onTimer, "op1", &t.op1, 30);
         try testing.expectEqual(1, loop.timers_pq.count());
         const ts2 = loop.op_pool.get(loop.timers_pq.peek().?).args.timer;
         try testing.expect(ts1.compare(ts2) == .lt);

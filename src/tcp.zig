@@ -42,7 +42,7 @@ pub fn Connector(
                     return self.handleError(err);
                 };
                 if (self.connect_timeout > 0) {
-                    self.loop.setTimer(Self, onTimeout, "timeout_op", &self.timeout_op, self.connect_timeout) catch |err| {
+                    self.loop.timeout(Self, onTimeout, "timeout_op", &self.timeout_op, self.connect_timeout) catch |err| {
                         return self.handleError(err);
                     };
                 }
@@ -61,7 +61,7 @@ pub fn Connector(
 
         fn connectComplete(self: *Self, res: io.SyscallError!void) void {
             assert(self.timeout_op != null);
-            if (self.timeout_op) |op| self.loop.removeTimer(op);
+            if (self.timeout_op) |op| self.loop.timeoutRemove(op);
             assert(self.timeout_op == null);
             if (res) {
                 onConnect(self.parent(), self.fd) catch |err| return self.handleError(err);
@@ -270,7 +270,7 @@ pub fn Connection(
         }
 
         fn recvIntoComplete(self: *Self, res: io.SyscallError!u32) void {
-            if (self.timeout_op) |op| self.loop.removeTimer(op);
+            if (self.timeout_op) |op| self.loop.timeoutRemove(op);
             if (res) |n| {
                 const buf = self.recv_buffer[0..n];
                 self.recv_buffer = &.{};
@@ -301,7 +301,7 @@ pub fn Connection(
         }
 
         fn recvComplete(self: *Self, res: io.SyscallError![]u8) void {
-            if (self.timeout_op) |op| self.loop.removeTimer(op);
+            if (self.timeout_op) |op| self.loop.timeoutRemove(op);
             if (res) |buf| {
                 if (buf.len == 0) return self.handleError(error.EndOfFile);
                 onRecv(self.parent(), buf) catch |err| {
@@ -316,7 +316,7 @@ pub fn Connection(
 
         fn recvTimeout(self: *Self) void {
             if (self.recv_timeout > 0) {
-                self.loop.setTimer(Self, onRecvTimeout, "timeout_op", &self.timeout_op, self.recv_timeout) catch |err| {
+                self.loop.timeout(Self, onRecvTimeout, "timeout_op", &self.timeout_op, self.recv_timeout) catch |err| {
                     return self.handleError(err);
                 };
             }
