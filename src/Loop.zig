@@ -532,7 +532,7 @@ pub fn setTimer(
     self.timers_pq.add(@intCast(idx)) catch unreachable;
 }
 
-fn removeTimer(self: *Loop, idx: u32) void {
+pub fn removeTimer(self: *Loop, idx: u32) void {
     for (self.timers_pq.items, 0..) |v, i| if (v == idx) {
         _ = self.timers_pq.removeIndex(i);
         self.releaseOp(idx);

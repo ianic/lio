@@ -15,9 +15,10 @@ pub fn Connector(
 
         loop: *io.Loop,
         addr: std.net.Address,
-        connect_timeout: linux.kernel_timespec = .{ .sec = 10, .nsec = 0 },
+        connect_timeout: u32 = 10000, // in milliseconds
         fd: linux.fd_t = -1,
-        op: ?u32 = null,
+        connect_op: ?u32 = null,
+        timeout_op: ?u32 = null,
 
         inline fn parent(self: *Self) *Parent {
             return @alignCast(@fieldParentPtr(parent_field_name, self));
@@ -29,7 +30,7 @@ pub fn Connector(
 
         pub fn connect(self: *Self) void {
             assert(self.fd < 0);
-            self.loop.socket(Self, socketComplete, "op", &self.op, self.addr.any.family, linux.SOCK.STREAM) catch |err| {
+            self.loop.socket(Self, socketComplete, "connect_op", &self.connect_op, self.addr.any.family, linux.SOCK.STREAM) catch |err| {
                 return self.handleError(err);
             };
         }
@@ -37,16 +38,31 @@ pub fn Connector(
         fn socketComplete(self: *Self, res: io.SyscallError!linux.fd_t) void {
             if (res) |fd| {
                 self.fd = fd;
-                self.loop.connect(Self, connectComplete, "op", &self.op, fd, &self.addr, &self.connect_timeout) catch |err| {
+                self.loop.connect(Self, connectComplete, "connect_op", &self.connect_op, fd, &self.addr, null) catch |err| {
                     return self.handleError(err);
                 };
+                if (self.connect_timeout > 0) {
+                    self.loop.setTimer(Self, onTimeout, "timeout_op", &self.timeout_op, self.connect_timeout) catch |err| {
+                        return self.handleError(err);
+                    };
+                }
             } else |err| switch (err) {
                 error.InterruptedSystemCall => self.connect(),
                 else => self.handleError(err),
             }
         }
 
+        fn onTimeout(self: *Self) void {
+            // TimerExpired TIME = 62
+            // ConnectionTimedOut TIMEDOUT = 110
+            assert(self.timeout_op == null);
+            self.handleError(error.ConnectionTimedOut);
+        }
+
         fn connectComplete(self: *Self, res: io.SyscallError!void) void {
+            assert(self.timeout_op != null);
+            if (self.timeout_op) |op| self.loop.removeTimer(op);
+            assert(self.timeout_op == null);
             if (res) {
                 onConnect(self.parent(), self.fd) catch |err| return self.handleError(err);
                 self.fd = -2; // fd ownership transferred to the connection
@@ -65,7 +81,8 @@ pub fn Connector(
 
         pub fn close(self: *Self) !void {
             if (self.fd < 0) return;
-            if (self.op) |op| try self.loop.detach(op);
+            if (self.connect_op) |op| try self.loop.detach(op);
+            if (self.timeout_op) |op| try self.loop.detach(op);
             try self.loop.close(self.fd);
             self.fd = -1;
         }
@@ -190,9 +207,11 @@ pub fn Connection(
         loop: *io.Loop,
         fd: linux.fd_t = -1,
         buffer_group_id: u16 = 0,
+        recv_timeout: u32 = 0,
         // Operation references used for cancelation on close
         send_op: ?u32 = null,
         recv_op: ?u32 = null,
+        timeout_op: ?u32 = null,
         // Remember send/recv buffer so we can repeat operation on interrupt
         recv_buffer: []u8 = &.{},
         send_buffer: []const u8 = &.{},
@@ -247,9 +266,11 @@ pub fn Connection(
                 return self.handleError(err);
             };
             self.recv_buffer = buffer;
+            self.recvTimeout();
         }
 
         fn recvIntoComplete(self: *Self, res: io.SyscallError!u32) void {
+            if (self.timeout_op) |op| self.loop.removeTimer(op);
             if (res) |n| {
                 const buf = self.recv_buffer[0..n];
                 self.recv_buffer = &.{};
@@ -276,9 +297,11 @@ pub fn Connection(
             ) catch |err| {
                 return self.handleError(err);
             };
+            self.recvTimeout();
         }
 
         fn recvComplete(self: *Self, res: io.SyscallError![]u8) void {
+            if (self.timeout_op) |op| self.loop.removeTimer(op);
             if (res) |buf| {
                 if (buf.len == 0) return self.handleError(error.EndOfFile);
                 onRecv(self.parent(), buf) catch |err| {
@@ -289,6 +312,18 @@ pub fn Connection(
                 //error.OperationCanceled => unreachable,
                 else => self.handleError(err),
             }
+        }
+
+        fn recvTimeout(self: *Self) void {
+            if (self.recv_timeout > 0) {
+                self.loop.setTimer(Self, onRecvTimeout, "timeout_op", &self.timeout_op, self.recv_timeout) catch |err| {
+                    return self.handleError(err);
+                };
+            }
+        }
+
+        fn onRecvTimeout(self: *Self) void {
+            self.handleError(error.TimerExpired);
         }
 
         fn handleError(self: *Self, err: anyerror) void {
@@ -303,6 +338,7 @@ pub fn Connection(
             if (self.fd < 0) return;
             if (self.recv_op) |op| try self.loop.detach(op);
             if (self.send_op) |op| try self.loop.detach(op);
+            if (self.timeout_op) |op| try self.loop.detach(op);
             try self.loop.close(self.fd);
             self.fd = -1;
         }
@@ -323,9 +359,9 @@ test "sizeOf" {
         fn onClose(_: *Self, _: anyerror) void {}
     };
 
-    try std.testing.expectEqual(224, @sizeOf(Client));
-    try std.testing.expectEqual(152, @sizeOf(Connector(Client, "connector", Client.onConnect, Client.onConnectError)));
-    try std.testing.expectEqual(72, @sizeOf(Connection(Client, "conn", Client.onRecv, Client.onSend, Client.onClose)));
+    try std.testing.expectEqual(232, @sizeOf(Client));
+    try std.testing.expectEqual(144, @sizeOf(Connector(Client, "connector", Client.onConnect, Client.onConnectError)));
+    try std.testing.expectEqual(88, @sizeOf(Connection(Client, "conn", Client.onRecv, Client.onSend, Client.onClose)));
 
     try std.testing.expectEqual(112, @sizeOf(std.net.Address));
     try std.testing.expectEqual(16, @sizeOf(linux.kernel_timespec));

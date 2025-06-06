@@ -36,8 +36,7 @@ pub fn main() !void {
     var cli = try Client.init(gpa, &loop, addr, config, host);
     cli.connect();
 
-    while (true)
-        try loop.tick();
+    try loop.drain();
 }
 
 fn getAddress(allocator: mem.Allocator, host: []const u8, port: u16) !net.Address {
@@ -86,6 +85,7 @@ const Client = struct {
         recv_buf: []const u8,
     ) !void {
         self.conn = try .init(self.allocator, self.loop, fd, tls_conn, recv_buf);
+        self.conn.tcp.recv_timeout = 1000;
         try self.get(self.host);
         self.allocator.destroy(self.connector);
     }
@@ -101,12 +101,12 @@ const Client = struct {
     }
 
     fn onClose(_: *Self, err: anyerror) void {
-        log.debug("connection close {}", .{err});
+        if (err != error.TimerExpired)
+            log.debug("connection close {}", .{err});
     }
 
     fn onConnectError(self: *Self, err: anyerror) void {
         self.allocator.destroy(self.connector);
         log.err("connect error {}", .{err});
-        unreachable;
     }
 };

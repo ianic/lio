@@ -190,7 +190,7 @@ test "sizeOf" {
         fn onClose(_: *Self, _: anyerror) void {}
     };
 
-    try std.testing.expectEqual(320, @sizeOf(Client));
-    try std.testing.expectEqual(67584, @sizeOf(Connector(Client, Client.onConnect, Client.onClose)));
-    try std.testing.expectEqual(312, @sizeOf(Connection(Client, "conn", Client.onRecv, Client.onClose)));
+    try std.testing.expectEqual(336, @sizeOf(Client));
+    try std.testing.expectEqual(67600, @sizeOf(Connector(Client, Client.onConnect, Client.onClose)));
+    try std.testing.expectEqual(328, @sizeOf(Connection(Client, "conn", Client.onRecv, Client.onClose)));
 }

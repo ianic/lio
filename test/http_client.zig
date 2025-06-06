@@ -23,6 +23,7 @@ pub fn main() !void {
     _ = try loop.addBufferGroup(4096, 1);
 
     var cli: Client = .init(&loop, addr, host);
+    cli.connector.connect_timeout = 1000;
     cli.connector.connect();
 
     try loop.drain();
@@ -56,6 +57,7 @@ const Client = struct {
 
     fn onConnect(self: *Self, fd: linux.fd_t) !void {
         self.conn.fd = fd;
+        self.conn.recv_timeout = 1000;
         try self.get(self.host);
     }
 
@@ -83,9 +85,8 @@ const Client = struct {
 
     fn onClose(self: *Self, err: anyerror) void {
         switch (err) {
-            error.EndOfFile => {
-                return;
-            },
+            error.EndOfFile => return,
+            error.TimerExpired => return,
             error.BrokenPipe, error.ConnectionResetByPeer => {
                 log.debug("connection close {}", .{err});
             },
