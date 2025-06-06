@@ -465,10 +465,26 @@ pub fn close(self: *Loop, fd: linux.fd_t) SubmitError!void {
 }
 
 /// Cancel single operation by index.
-pub fn cancel(self: *Loop, idx: usize) SubmitError!void {
+pub fn cancel(self: *Loop, user_data: u64) SubmitError!void {
     try self.ensureSqCapacity(1);
-    var sqe = self.ring.cancel(rsv_user_data.skip, idx, 0) catch unreachable;
+    var sqe = self.ring.cancel(rsv_user_data.skip, user_data, 0) catch unreachable;
     sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
+}
+
+fn syncCancel(self: *Loop, user_data: u64) SyscallError!void {
+    var reg = mem.zeroInit(linux.io_uring_sync_cancel_reg, .{
+        .addr = user_data,
+    });
+    const res = linux.io_uring_register(
+        self.ring.fd,
+        .REGISTER_SYNC_CANCEL,
+        @as(*const anyopaque, @ptrCast(&reg)),
+        1,
+    );
+    switch (linux.E.init(res)) {
+        .SUCCESS => return,
+        else => |errno| return @import("errno.zig").toError(errno),
+    }
 }
 
 pub fn cancelAll(self: *Loop) SubmitError!void {
@@ -1031,4 +1047,33 @@ test "timestam from/to Linux" {
     //     ts.toLinux(),
     //     try std.posix.clock_gettime(.REALTIME),
     // });
+}
+
+test "syncCancel" {
+    var loop = try Loop.init(testing.allocator, .{
+        .entries = 4,
+        .fd_nr = 2,
+        .flags = 0,
+    });
+    defer loop.deinit();
+
+    const tc: timespec = .{ .sec = 1, .nsec = 0 };
+    _ = try loop.ring.timeout(0xab, &tc, 0, 0);
+    try testing.expectEqual(1, try loop.ring.submit());
+
+    try loop.syncCancel(0xab);
+    const cqes = loop.peekCq();
+    try testing.expectEqual(1, cqes.len);
+    const cqe = cqes[0];
+    try testing.expectEqual(0xab, cqe.user_data);
+    try testing.expectEqual(.CANCELED, cqe.err());
+    loop.ring.cq_advance(@intCast(cqes.len));
+}
+
+fn peekCq(self: *Loop) []linux.io_uring_cqe {
+    const ring = &self.ring;
+    const ready = ring.cq_ready();
+    const head = ring.cq.head.* & ring.cq.mask;
+    const tail = @min(ring.cq.cqes.len - head, ready);
+    return ring.cq.cqes[head..][0..tail];
 }
