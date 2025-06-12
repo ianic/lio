@@ -167,6 +167,8 @@ pub fn Connection(
             const res = try self.tls.decrypt(ciphertext, ciphertext);
             if (res.cleartext.len > 0) {
                 try onRecv(self.parent(), res.cleartext);
+            } else {
+                self.tcp.recv();
             }
             try self.recv_buf.set(self.allocator, res.unused_ciphertext);
         }

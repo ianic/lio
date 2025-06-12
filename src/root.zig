@@ -35,6 +35,7 @@ pub const UnusedDataBuffer = struct {
             // nothing changed
             return;
         }
+        // unused is part of the self.buffer so free after dupe
         const old_buffer = self.buffer;
         if (unused.len > 0) {
             self.buffer = try allocator.dupe(u8, unused);

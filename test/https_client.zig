@@ -91,6 +91,11 @@ const Client = struct {
         self.allocator.destroy(self.connector);
     }
 
+    fn onConnectError(self: *Self, err: anyerror) void {
+        self.allocator.destroy(self.connector);
+        log.err("connect error {}", .{err});
+    }
+
     fn get(self: *Self, host: []const u8) !void {
         var buffer: [256]u8 = undefined;
         const request = try std.fmt.bufPrint(&buffer, "GET / HTTP/1.1\r\nHost: {s}\r\n\r\n", .{host});
@@ -102,18 +107,16 @@ const Client = struct {
     }
 
     fn onRecv(self: *Self, data: []const u8) !void {
-        std.debug.print("onRecv: {} recv_buf.len: {}\n", .{ data.len, self.conn.recv_buf.buffer.len });
         self.conn.recv();
+        log.debug(
+            "onRecv: {} recv_buf.len: {}, active_op {}",
+            .{ data.len, self.conn.recv_buf.buffer.len, self.loop.metric.active_op },
+        );
     }
 
     fn onError(self: *Self, err: anyerror) void {
         if (err != error.TimerExpired)
             log.debug("connection close {}", .{err});
         self.conn.deinit();
-    }
-
-    fn onConnectError(self: *Self, err: anyerror) void {
-        self.allocator.destroy(self.connector);
-        log.err("connect error {}", .{err});
     }
 };
