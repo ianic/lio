@@ -3,7 +3,6 @@ const tls = @import("tls");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 const mem = std.mem;
-
 const io = @import("root.zig");
 const tcp = @import("tcp.zig");
 
@@ -18,7 +17,7 @@ pub fn Connector(
         const Self = @This();
 
         tcp_connector: io.tcp.Connector(Self, "tcp_connector", onTcpConnect, onTcpConnectError),
-        tcp_conn: io.tcp.Connection(Self, "tcp_conn", onRecv, onSend, onClose),
+        tcp_conn: io.tcp.Connection(Self, "tcp_conn", onRecv, onSend, onTcpError),
         tls_handshake: tls.nonblock.Client = undefined,
         config: tls.config.Client,
 
@@ -79,7 +78,7 @@ pub fn Connector(
             self.tcp_conn.recvInto(self.recv_buf[self.recv_tail..]);
         }
 
-        fn onSend(self: *Self, _: []const u8) !void {
+        fn onSend(self: *Self) !void {
             self.handshake();
         }
 
@@ -92,14 +91,14 @@ pub fn Connector(
             self.handleError(err);
         }
 
-        fn onClose(self: *Self, err: anyerror) void {
+        fn onTcpError(self: *Self, err: anyerror) void {
             if (err == error.EndOfFile) return self.handshake();
             self.handleError(err);
         }
 
         fn handleError(self: *Self, err: anyerror) void {
-            self.tcp_connector.close() catch {};
-            self.tcp_conn.close() catch {};
+            self.tcp_connector.close();
+            self.tcp_conn.close();
             onError(self.parent, err);
         }
     };
@@ -108,16 +107,18 @@ pub fn Connector(
 pub fn Connection(
     comptime Parent: type,
     comptime parent_field_name: []const u8,
+    comptime onSend: *const fn (*Parent) anyerror!void,
     comptime onRecv: *const fn (*Parent, []const u8) anyerror!void,
-    comptime onClose: *const fn (*Parent, anyerror) void,
+    comptime onError: *const fn (*Parent, anyerror) void,
 ) type {
     return struct {
         const Self = @This();
 
         allocator: mem.Allocator,
-        tcp: io.tcp.Connection(Self, "tcp", onTcpRecv, onTcpSend, onTcpClose),
+        tcp: io.tcp.Connection(Self, "tcp", onTcpRecv, onTcpSend, onTcpError),
         tls: tls.nonblock.Connection,
         recv_buf: io.UnusedDataBuffer = .{},
+        send_buf: []const u8 = &.{},
 
         pub fn init(
             allocator: mem.Allocator,
@@ -141,15 +142,23 @@ pub fn Connection(
         }
 
         pub fn send(self: *Self, cleartext: []const u8) !void {
+            assert(self.send_buf.len == 0);
             const ciphertext = try self.allocator.alloc(u8, self.tls.encryptedLength(cleartext.len));
             errdefer self.allocator.free(ciphertext);
             const res = try self.tls.encrypt(cleartext, ciphertext);
-            self.tcp.send(res.ciphertext);
+            assert(res.ciphertext.len == ciphertext.len);
+            self.send_buf = res.ciphertext;
+            self.tcp.send(self.send_buf);
+        }
+
+        pub fn recv(self: *Self) void {
             self.tcp.recv();
         }
 
-        fn onTcpSend(self: *Self, ciphertext: []const u8) !void {
-            self.allocator.free(ciphertext);
+        fn onTcpSend(self: *Self) !void {
+            self.allocator.free(self.send_buf);
+            self.send_buf = &.{};
+            try onSend(self.parent());
         }
 
         fn onTcpRecv(self: *Self, data: []u8) !void {
@@ -160,20 +169,19 @@ pub fn Connection(
                 try onRecv(self.parent(), res.cleartext);
             }
             try self.recv_buf.set(self.allocator, res.unused_ciphertext);
-
-            self.tcp.recv();
         }
 
         pub fn deinit(self: *Self) void {
             self.recv_buf.deinit(self.allocator);
+            self.allocator.free(self.send_buf);
         }
 
         pub fn close(self: *Self) !void {
             try self.tcp.close();
         }
 
-        fn onTcpClose(self: *Self, err: anyerror) void {
-            onClose(self.parent(), err);
+        fn onTcpError(self: *Self, err: anyerror) void {
+            onError(self.parent(), err);
         }
     };
 }
@@ -182,15 +190,15 @@ test "sizeOf" {
     const Client = struct {
         const Self = @This();
 
-        connector: *io.tls.Connector(Self, onConnect, onClose),
-        conn: io.tls.Connection(Self, "conn", onRecv, onClose),
+        connector: *io.tls.Connector(Self, onConnect, onError),
+        conn: io.tls.Connection(Self, "conn", onRecv, onError),
 
         fn onConnect(_: *Self, _: linux.fd_t, _: tls.nonblock.Connection, _: []const u8) !void {}
         fn onRecv(_: *Self, _: []const u8) !void {}
-        fn onClose(_: *Self, _: anyerror) void {}
+        fn onError(_: *Self, _: anyerror) void {}
     };
 
     try std.testing.expectEqual(336, @sizeOf(Client));
-    try std.testing.expectEqual(67600, @sizeOf(Connector(Client, Client.onConnect, Client.onClose)));
-    try std.testing.expectEqual(328, @sizeOf(Connection(Client, "conn", Client.onRecv, Client.onClose)));
+    try std.testing.expectEqual(67600, @sizeOf(Connector(Client, Client.onConnect, Client.onError)));
+    try std.testing.expectEqual(328, @sizeOf(Connection(Client, "conn", Client.onRecv, Client.onError)));
 }

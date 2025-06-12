@@ -44,15 +44,61 @@ pub const Op = struct {
         if (self.ref) |ref| ref.* = null;
         self.callback = null;
     }
+
+    const callbacks = struct {
+        fn simple(
+            comptime Parent: type,
+            comptime onComplete: fn (*Parent, SyscallError!void) void,
+            comptime parent_field_name: []const u8,
+        ) Op.Callback {
+            return struct {
+                fn callback(_: *Loop, op: Op, cqe: linux.io_uring_cqe) void {
+                    onComplete(
+                        @alignCast(@fieldParentPtr(parent_field_name, op.ref.?)),
+                        if (success(cqe)) {} else |err| err,
+                    );
+                }
+            }.callback;
+        }
+        fn fd(
+            comptime Parent: type,
+            comptime onComplete: fn (*Parent, SyscallError!linux.fd_t) void,
+            comptime parent_field_name: []const u8,
+        ) Op.Callback {
+            return struct {
+                fn callback(_: *Loop, op: Op, cqe: linux.io_uring_cqe) void {
+                    onComplete(
+                        @alignCast(@fieldParentPtr(parent_field_name, op.ref.?)),
+                        if (success(cqe)) @intCast(cqe.res) else |err| err,
+                    );
+                }
+            }.callback;
+        }
+        fn len(
+            comptime Parent: type,
+            comptime onComplete: fn (*Parent, SyscallError!u32) void,
+            comptime parent_field_name: []const u8,
+        ) Op.Callback {
+            return struct {
+                fn callback(_: *Loop, op: Op, cqe: linux.io_uring_cqe) void {
+                    onComplete(
+                        @alignCast(@fieldParentPtr(parent_field_name, op.ref.?)),
+                        if (success(cqe)) @intCast(cqe.res) else |err| err,
+                    );
+                }
+            }.callback;
+        }
+    };
 };
 
 const Loop = @This();
 const yes_socket_option = std.mem.asBytes(&@as(u32, 1));
 // Reserved values for user_data
 const rsv_user_data = struct {
-    const skip: u64 = 0xff_ff_ff_ff_ff_ff_ff_ff;
-    const tick_timer: u64 = 0xff_ff_ff_ff_ff_ff_ff_fe;
-    const timers: u64 = 0xff_ff_ff_ff_ff_ff_ff_fd;
+    const none: u64 = 0xff_ff_ff_ff_ff_ff_ff_ff;
+    const skip_fail: u64 = 0xff_ff_ff_ff_ff_ff_ff_fe;
+    const tick_timer: u64 = 0xff_ff_ff_ff_ff_ff_ff_fd;
+    const timers: u64 = 0xff_ff_ff_ff_ff_ff_ff_fc;
 };
 
 allocator: mem.Allocator,
@@ -117,10 +163,16 @@ fn processCompletions(self: *Loop) void {
         const cqes = ring.cq.cqes[head..][0..tail];
         // Call callback of each completion
         for (cqes) |cqe| {
+            //log.debug("cqe: {}", .{cqe});
             if (cqe.user_data > std.math.maxInt(u32)) {
                 // handle reseved user data values
                 switch (cqe.user_data) {
-                    rsv_user_data.skip => {},
+                    rsv_user_data.none => {
+                        success(cqe) catch |err| {
+                            log.debug("cqe: res: {x}, user_data: {x}, err: {}", .{ cqe.res, cqe.user_data, err });
+                        };
+                    },
+                    rsv_user_data.skip_fail => {},
                     rsv_user_data.tick_timer => self.tick_timer_ts = null,
                     rsv_user_data.timers => self.fireTimers(),
                     else => unreachable,
@@ -212,7 +264,7 @@ fn releaseOp(self: *Loop, idx: u32) void {
     self.metric.active_op -= 1;
 }
 
-fn acquireOp(self: *Loop, ref: *?u32, callback: Op.Callback) error{OutOfMemory}!struct { *Op, usize } {
+fn acquireOp(self: *Loop, ref: *?u32, callback: Op.Callback) error{OutOfMemory}!struct { *Op, u32 } {
     assert(ref.* == null);
     const idx, const op = try self.op_pool.acquire();
     assert(op.ref == null);
@@ -275,12 +327,12 @@ pub fn listen(
     // (soft)link in the case of error in bind onComplete will always get
     // error.OperationCanceled.
     if (opt.reuse_address) {
-        sqe = self.ring.setsockopt(rsv_user_data.skip, fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, yes_socket_option) catch unreachable;
+        sqe = self.ring.setsockopt(rsv_user_data.none, fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, yes_socket_option) catch unreachable;
         sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
-        sqe = self.ring.setsockopt(rsv_user_data.skip, fd, linux.SOL.SOCKET, linux.SO.REUSEPORT, yes_socket_option) catch unreachable;
+        sqe = self.ring.setsockopt(rsv_user_data.none, fd, linux.SOL.SOCKET, linux.SO.REUSEPORT, yes_socket_option) catch unreachable;
         sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
     }
-    sqe = self.ring.bind(rsv_user_data.skip, fd, &addr.any, addr.getOsSockLen(), 0) catch unreachable;
+    sqe = self.ring.bind(rsv_user_data.none, fd, &addr.any, addr.getOsSockLen(), 0) catch unreachable;
     sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
     sqe = self.ring.listen(user_data, fd, opt.kernel_backlog, 0) catch unreachable;
     sqe.flags |= linux.IOSQE_FIXED_FILE;
@@ -318,7 +370,6 @@ pub fn connect(
         fn callback(_: *Loop, op: Op, cqe: linux.io_uring_cqe) void {
             onComplete(
                 @alignCast(@fieldParentPtr(parent_field_name, op.ref.?)),
-
                 if (success(cqe)) {} else |err| err,
             );
         }
@@ -328,7 +379,7 @@ pub fn connect(
     sqe.flags |= linux.IOSQE_FIXED_FILE;
     if (connect_timeout) |t| {
         sqe.flags |= linux.IOSQE_IO_LINK;
-        sqe = self.ring.link_timeout(rsv_user_data.skip, t, 0) catch unreachable;
+        sqe = self.ring.link_timeout(rsv_user_data.none, t, 0) catch unreachable;
         sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
     }
 }
@@ -453,21 +504,32 @@ pub fn close(self: *Loop, fd: linux.fd_t) SubmitError!void {
     if (fd < 0) return;
     try self.ensureSqCapacity(2);
 
-    // close socket
-    var sqe = self.ring.close_direct(rsv_user_data.skip, @intCast(fd)) catch unreachable;
-    sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
-    // cancel any fd operations
-    sqe = self.ring.get_sqe() catch unreachable;
+    // Cancel any fd operations, it will probably fail because all fd operations
+    // are already canceled.
+    var sqe = self.ring.get_sqe() catch unreachable;
     sqe.prep_cancel_fd(fd, linux.IORING_ASYNC_CANCEL_FD_FIXED);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
     sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
-    sqe.user_data = rsv_user_data.skip;
+    sqe.user_data = rsv_user_data.skip_fail; // ignore fail
+
+    // Close socket
+    sqe = self.ring.close_direct(rsv_user_data.none, @intCast(fd)) catch unreachable;
+    sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
+}
+
+pub fn closePipe(self: *Loop, fds: [2]linux.fd_t) SubmitError!void {
+    if (fds[0] < 0) return;
+    try self.ensureSqCapacity(2);
+    var sqe = self.ring.close(rsv_user_data.none, @intCast(fds[0])) catch unreachable;
+    sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
+    sqe = self.ring.close(rsv_user_data.none, @intCast(fds[1])) catch unreachable;
+    sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
 }
 
 /// Cancel single operation by index.
 pub fn cancel(self: *Loop, user_data: u64) SubmitError!void {
     try self.ensureSqCapacity(1);
-    var sqe = self.ring.cancel(rsv_user_data.skip, user_data, 0) catch unreachable;
+    var sqe = self.ring.cancel(rsv_user_data.none, user_data, 0) catch unreachable;
     sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
 }
 
@@ -489,19 +551,19 @@ fn syncCancel(self: *Loop, user_data: u64) SyscallError!void {
 
 pub fn cancelAll(self: *Loop) SubmitError!void {
     try self.ensureSqCapacity(1);
-    var sqe = self.ring.cancel(rsv_user_data.skip, 0, linux.IORING_ASYNC_CANCEL_ALL | linux.IORING_ASYNC_CANCEL_ANY) catch unreachable;
+    var sqe = self.ring.cancel(rsv_user_data.none, 0, linux.IORING_ASYNC_CANCEL_ALL | linux.IORING_ASYNC_CANCEL_ANY) catch unreachable;
     sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
 }
 
 /// Detach (don't call callback when completed) single operation by index and
-/// cancel that operation if still active.
-pub fn detach(self: *Loop, idx: u32) !void {
+/// try to cancel that operation.
+pub fn detach(self: *Loop, idx: u32) void {
     const op = self.op_pool.getPtr(idx);
     assert(op.ref != null);
     op.detach();
     switch (op.args) {
-        .timer => self.timeoutRemove(@intCast(idx)),
-        else => try self.cancel(idx),
+        .timer => self.timeoutRemove(idx),
+        else => self.cancel(idx) catch {},
     }
 }
 
@@ -599,6 +661,65 @@ fn timersCompare(loop: *Loop, a_idx: u32, b_idx: u32) std.math.Order {
     return ts_a.compare(ts_b);
 }
 
+pub fn openAt(
+    self: *Loop,
+    comptime Parent: type,
+    comptime onComplete: fn (*Parent, SyscallError!linux.fd_t) void,
+    comptime parent_field_name: []const u8,
+    parent_field_ptr: *?u32,
+    dir_fd: linux.fd_t,
+    path: [*:0]const u8,
+    flags: linux.O,
+    mode: linux.mode_t,
+) PrepareError!void {
+    try self.ensureSqCapacity(1);
+    _, const user_data = try self.acquireOp(parent_field_ptr, Op.callbacks.fd(Parent, onComplete, parent_field_name));
+    _ = self.ring.openat_direct(user_data, dir_fd, path, flags, mode, linux.IORING_FILE_INDEX_ALLOC) catch unreachable;
+}
+
+pub const offset_append = std.math.maxInt(u64);
+
+pub fn write(
+    self: *Loop,
+    comptime Parent: type,
+    comptime onComplete: fn (*Parent, SyscallError!u32) void,
+    comptime parent_field_name: []const u8,
+    parent_field_ptr: *?u32,
+    fd: linux.fd_t,
+    buffer: []const u8,
+    offset: u64,
+) PrepareError!void {
+    try self.ensureSqCapacity(1);
+    _, const user_data = try self.acquireOp(parent_field_ptr, Op.callbacks.len(Parent, onComplete, parent_field_name));
+    var sqe = self.ring.write(user_data, fd, buffer, offset) catch unreachable;
+    sqe.flags |= linux.IOSQE_FIXED_FILE;
+}
+
+pub fn sendfile(
+    self: *Loop,
+    comptime Parent: type,
+    comptime onComplete: fn (*Parent, SyscallError!u32) void,
+    comptime parent_field_name: []const u8,
+    parent_field_ptr: *?u32,
+    fd_out: linux.fd_t,
+    fd_in: linux.fd_t,
+    pipe_fds: [2]linux.fd_t,
+    offset: u64,
+    len: u32,
+) PrepareError!void {
+    try self.ensureSqCapacity(2);
+    _, const user_data = try self.acquireOp(parent_field_ptr, Op.callbacks.len(Parent, onComplete, parent_field_name));
+
+    const SPLICE_F_NONBLOCK = 0x02;
+    const no_offset = std.math.maxInt(u64);
+    var sqe = self.ring.splice(rsv_user_data.none, fd_in, offset, pipe_fds[1], no_offset, len) catch unreachable;
+    sqe.rw_flags = linux.IORING_SPLICE_F_FD_IN_FIXED + SPLICE_F_NONBLOCK;
+    sqe.flags |= linux.IOSQE_IO_HARDLINK;
+    sqe = self.ring.splice(user_data, pipe_fds[0], no_offset, fd_out, no_offset, len) catch unreachable;
+    sqe.rw_flags = SPLICE_F_NONBLOCK;
+    sqe.flags |= linux.IOSQE_FIXED_FILE;
+}
+
 test "socket" {
     var loop = try Loop.init(testing.allocator, .{
         .entries = 1,
@@ -654,7 +775,7 @@ test "socket" {
         try testing.expectEqual(ctx.err.?, error.FileTableOverflow);
     }
     { // return one used fd to the kernel
-        _ = try loop.ring.close_direct(rsv_user_data.skip, @intCast(used_fd));
+        _ = try loop.ring.close_direct(rsv_user_data.none, @intCast(used_fd));
         try loop.tickNr(1);
     }
     { // success
@@ -700,7 +821,7 @@ test "ensure ensureSqCapacity pushes sqes to the kernel" {
 
 test "OutOfMemory on operations list unable to grow" {
     const ops_count = 8;
-    var buf: [ops_count * @sizeOf(Op) + ops_count * @sizeOf(u32)]u8 = undefined;
+    var buf: [ops_count * @sizeOf(Op) + ops_count * @sizeOf(u32) + 6]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
     var loop = try Loop.init(fba.allocator(), .{
         .entries = 2,
@@ -926,7 +1047,7 @@ test "timers" {
     { // detached
         try testing.expect(t.op1 != null);
         try testing.expectEqual(1, loop.timers_pq.count());
-        try loop.detach(t.op1.?);
+        loop.detach(t.op1.?);
         try testing.expect(t.op1 == null);
         try testing.expectEqual(0, loop.timers_pq.count());
     }

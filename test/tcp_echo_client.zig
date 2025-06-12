@@ -54,7 +54,7 @@ const Client = struct {
 
     loop: *io.Loop,
     connector: io.tcp.Connector(Self, "connector", onConnect, onConnectError),
-    conn: io.tcp.Connection(Self, "conn", onRecv, onSend, onClose),
+    conn: io.tcp.Connection(Self, "conn", onRecv, onSend, onError),
 
     buffer: [64 * 1024]u8 = undefined,
     send_bytes: u32 = 0,
@@ -88,7 +88,7 @@ const Client = struct {
     // Start echo cycle, send random bytes and expect to receive same bytes
     fn echo(self: *Self) void {
         if (self.total_bytes > 1024 * 1024 * 1024) {
-            self.conn.close() catch unreachable;
+            self.conn.close();
             self.onConnectError(error.EndOfFile);
             return;
         }
@@ -98,7 +98,7 @@ const Client = struct {
         self.conn.send(buffer[0..self.send_bytes]);
     }
 
-    fn onSend(self: *Self, _: []const u8) !void {
+    fn onSend(self: *Self) !void {
         self.conn.recv();
     }
 
@@ -114,14 +114,19 @@ const Client = struct {
         }
     }
 
-    fn onClose(self: *Self, err: anyerror) void {
+    fn onError(self: *Self, err: anyerror) void {
         switch (err) {
-            error.EndOfFile => {},
+            error.EndOfFile => {
+                // clean close
+            },
             error.BrokenPipe, error.ConnectionResetByPeer => {
                 log.debug("connection close {}", .{err});
             },
+            error.TimerExpired, error.ConnectionTimedOut => {
+                log.debug("connection recv timeout {}", .{err});
+            },
             else => {
-                log.err("connection close {}", .{err});
+                log.err("connection error {}", .{err});
             },
         }
         self.onConnectError(err);

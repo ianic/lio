@@ -8,7 +8,7 @@ pub fn Connector(
     comptime Parent: type,
     comptime parent_field_name: []const u8,
     comptime onConnect: *const fn (*Parent, linux.fd_t) anyerror!void,
-    comptime onError: *const fn (*Parent, err: anyerror) void,
+    comptime onError: *const fn (*Parent, anyerror) void,
 ) type {
     return struct {
         const Self = @This();
@@ -53,8 +53,6 @@ pub fn Connector(
         }
 
         fn onTimeout(self: *Self) void {
-            // TimerExpired TIME = 62
-            // ConnectionTimedOut TIMEDOUT = 110
             assert(self.timeout_op == null);
             self.handleError(error.ConnectionTimedOut);
         }
@@ -72,18 +70,18 @@ pub fn Connector(
         }
 
         fn handleError(self: *Self, err: anyerror) void {
-            self.close() catch |e| {
-                log.err("connector close {}", .{e});
-                self.fd = -1;
-            };
+            self.close();
             onError(self.parent(), err);
         }
 
-        pub fn close(self: *Self) !void {
+        pub fn close(self: *Self) void {
             if (self.fd < 0) return;
-            if (self.connect_op) |op| try self.loop.detach(op);
-            if (self.timeout_op) |op| try self.loop.detach(op);
-            try self.loop.close(self.fd);
+            if (self.connect_op) |op| self.loop.detach(op);
+            if (self.timeout_op) |op| self.loop.detach(op);
+            self.loop.close(self.fd) catch |err| {
+                log.err("tcp connector close {}", .{err});
+                return;
+            };
             self.fd = -1;
         }
     };
@@ -103,6 +101,15 @@ pub fn isNetworkError(err: anyerror) bool {
         error.NetworkIsUnreachable, // ENETUNREACH
         error.NoRouteToHost, // EHOSTUNREACH
         error.ConnectionTimedOut, // ETIMEDOUT
+        => true,
+        else => false,
+    };
+}
+
+pub fn isTimeoutError(err: anyerror) bool {
+    return switch (err) {
+        error.TimerExpired, // ETIME = 62
+        error.ConnectionTimedOut, // ETIMEDOUT = 110
         => true,
         else => false,
     };
@@ -178,17 +185,17 @@ pub fn Listener(
         }
 
         fn handleError(self: *Self, err: anyerror) void {
-            self.close() catch |e| {
-                log.err("connector close {}", .{e});
-                self.fd = -1;
-            };
+            self.close();
             onError(self.parent(), err);
         }
 
-        pub fn close(self: *Self) !void {
+        pub fn close(self: *Self) void {
             if (self.fd < 0) return;
-            if (self.op) |op| try self.loop.detach(op);
-            try self.loop.close(self.fd);
+            if (self.op) |op| self.loop.detach(op);
+            self.loop.close(self.fd) catch |err| {
+                log.err("tcp listener close {}", .{err});
+                return;
+            };
             self.fd = -1;
         }
     };
@@ -198,8 +205,8 @@ pub fn Connection(
     comptime Parent: type,
     comptime parent_field_name: []const u8,
     comptime onRecv: *const fn (*Parent, []u8) anyerror!void,
-    comptime onSend: *const fn (*Parent, []const u8) anyerror!void,
-    comptime onClose: *const fn (*Parent, anyerror) void,
+    comptime onSend: *const fn (*Parent) anyerror!void,
+    comptime onError: *const fn (*Parent, anyerror) void,
 ) type {
     return struct {
         const Self = @This();
@@ -212,10 +219,26 @@ pub fn Connection(
         send_op: ?u32 = null,
         recv_op: ?u32 = null,
         timeout_op: ?u32 = null,
+
         // Remember send/recv buffer so we can repeat operation on interrupt
         recv_buffer: []u8 = &.{},
-        send_buffer: []const u8 = &.{},
-        send_len: usize = 0,
+        send_args: ?SendArgs = null,
+        sent_len: usize = 0,
+
+        // Pipe file descriptors used in sendfile splices.
+        // Created by sync system call on first use.
+        pipe_fds: [2]linux.fd_t = .{ -1, -1 },
+
+        pub const SendArgs = union(enum) {
+            // simple data buffer send argument
+            buffer: []const u8,
+            // send file arguments
+            file: struct {
+                fd_in: linux.fd_t = -1,
+                offset: u64 = 0,
+                len: u32 = 0,
+            },
+        };
 
         inline fn parent(self: *Self) *Parent {
             return @alignCast(@fieldParentPtr(parent_field_name, self));
@@ -228,36 +251,80 @@ pub fn Connection(
             };
         }
 
-        pub fn send(self: *Self, buffer: []const u8) void {
-            assert(self.send_buffer.len == 0);
-            self.send_buffer = buffer;
-            self.send_len = 0;
+        pub fn send(self: *Self, data: []const u8) void {
+            self.sendArgs(.{ .buffer = data });
+        }
+
+        pub fn sendfile(self: *Self, fd: linux.fd_t, offset: u64, len: u32) void {
+            self.sendArgs(.{ .file = .{ .fd_in = fd, .offset = offset, .len = len } });
+        }
+
+        fn sendArgs(self: *Self, args: SendArgs) void {
+            assert(self.send_args == null);
+            self.send_args = args;
+            self.sent_len = 0;
             self.sendSubmit();
         }
 
         fn sendSubmit(self: *Self) void {
-            const buf = self.send_buffer[self.send_len..];
-            self.loop.send(Self, sendComplete, "send_op", &self.send_op, self.fd, buf) catch |err| {
-                return self.handleError(err);
-            };
+            switch (self.send_args.?) {
+                .buffer => |buf| {
+                    self.loop.send(
+                        Self,
+                        sendComplete,
+                        "send_op",
+                        &self.send_op,
+                        self.fd,
+                        buf[self.sent_len..],
+                    ) catch |err| {
+                        return self.handleError(err);
+                    };
+                },
+                .file => |arg| {
+                    if (self.pipe_fds[0] == -1) {
+                        self.pipe_fds = std.posix.pipe() catch |err| {
+                            return self.handleError(err);
+                        };
+                    }
+
+                    self.loop.sendfile(
+                        Self,
+                        sendComplete,
+                        "send_op",
+                        &self.send_op,
+                        self.fd,
+                        arg.fd_in,
+                        self.pipe_fds,
+                        arg.offset,
+                        arg.len,
+                    ) catch |err| {
+                        return self.handleError(err);
+                    };
+                },
+            }
         }
 
         fn sendComplete(self: *Self, res: io.SyscallError!u32) void {
             if (res) |n| {
-                self.send_len += n;
-                if (self.send_len < self.send_buffer.len) {
+                self.sent_len += n;
+                const data_len = switch (self.send_args.?) {
+                    .buffer => |buf| buf.len,
+                    .file => |arg| arg.len,
+                };
+                if (self.sent_len < data_len) {
                     // short send, send rest of the data
                     return self.sendSubmit();
                 }
-                const buf = self.send_buffer;
-                self.send_buffer = &.{};
-                onSend(self.parent(), buf) catch |err| {
+                self.send_args = null;
+                onSend(self.parent()) catch |err| {
                     return self.handleError(err);
                 };
             } else |err| switch (err) {
                 error.InterruptedSystemCall => self.sendSubmit(),
-                //error.OperationCanceled => unreachable,
-                else => self.handleError(err),
+                else => {
+                    self.send_args = null;
+                    self.handleError(err);
+                },
             }
         }
 
@@ -280,8 +347,10 @@ pub fn Connection(
                 };
             } else |err| switch (err) {
                 error.InterruptedSystemCall => self.recvInto(self.recv_buffer),
-                // error.OperationCanceled => unreachable,
-                else => self.handleError(err),
+                else => {
+                    self.recv_buffer = &.{};
+                    self.handleError(err);
+                },
             }
         }
 
@@ -309,7 +378,6 @@ pub fn Connection(
                 };
             } else |err| switch (err) {
                 error.NoBufferSpaceAvailable, error.InterruptedSystemCall => self.recv(),
-                //error.OperationCanceled => unreachable,
                 else => self.handleError(err),
             }
         }
@@ -327,20 +395,27 @@ pub fn Connection(
         }
 
         fn handleError(self: *Self, err: anyerror) void {
-            self.close() catch |e| {
-                log.err("tcp close {}", .{e});
-                self.fd = -1;
-            };
-            onClose(self.parent(), err);
+            self.close();
+            onError(self.parent(), err);
         }
 
-        pub fn close(self: *Self) !void {
+        pub fn close(self: *Self) void {
             if (self.fd < 0) return;
-            if (self.recv_op) |op| try self.loop.detach(op);
-            if (self.send_op) |op| try self.loop.detach(op);
-            if (self.timeout_op) |op| try self.loop.detach(op);
-            try self.loop.close(self.fd);
-            self.fd = -1;
+            if (self.timeout_op) |op| self.loop.timeoutRemove(op);
+            if (self.recv_op) |op| self.loop.detach(op);
+            if (self.send_op) |op| self.loop.detach(op);
+            if (self.pipe_fds[0] != -1) {
+                if (self.loop.closePipe(self.pipe_fds)) {
+                    self.pipe_fds = .{ -1, -1 };
+                } else |err| {
+                    log.err("tcp close pipe {}", .{err});
+                }
+            }
+            if (self.loop.close(self.fd)) {
+                self.fd = -1;
+            } else |err| {
+                log.err("tcp connection close {}", .{err});
+            }
         }
     };
 }

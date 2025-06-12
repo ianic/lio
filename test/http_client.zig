@@ -41,7 +41,7 @@ const Client = struct {
 
     loop: *io.Loop,
     connector: io.tcp.Connector(Self, "connector", onConnect, onConnectError),
-    conn: io.tcp.Connection(Self, "conn", onRecv, onSend, onClose),
+    conn: io.tcp.Connection(Self, "conn", onRecv, onSend, onError),
     buffer: [64 * 1024]u8 = undefined,
 
     host: []const u8,
@@ -74,7 +74,7 @@ const Client = struct {
         self.conn.send(request);
     }
 
-    fn onSend(self: *Self, _: []const u8) !void {
+    fn onSend(self: *Self) !void {
         self.conn.recv();
     }
 
@@ -83,7 +83,7 @@ const Client = struct {
         self.conn.recv();
     }
 
-    fn onClose(self: *Self, err: anyerror) void {
+    fn onError(self: *Self, err: anyerror) void {
         switch (err) {
             error.EndOfFile => return,
             error.TimerExpired => return,

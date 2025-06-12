@@ -4,58 +4,35 @@ const linux = std.os.linux;
 const posix = std.posix;
 const io = @import("lio");
 const mem = std.mem;
-const signal = @import("signal.zig");
 
 const log = std.log.scoped(.main);
 pub const std_options = std.Options{ .log_level = .debug };
 
 pub fn main() !void {
-    signal.setHandler();
-
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
     defer _ = debug_allocator.deinit();
     const gpa = debug_allocator.allocator();
 
+    cwd = std.fs.cwd();
+
     var loop = try io.Loop.init(gpa, .{
         .entries = 4096,
         .fd_nr = 1024,
-        .flags = 0, //linux.IORING_SETUP_SINGLE_ISSUER, //| linux.IORING_SETUP_SQPOLL,
     });
     defer loop.deinit();
 
-    const addr: std.net.Address = try std.net.Address.resolveIp("127.0.0.1", 9900);
+    const addr: std.net.Address = try std.net.Address.resolveIp("127.0.0.1", 9901);
     var listener: Listener = .{
         .tcp = .init(&loop, addr),
         .allocator = gpa,
         .loop = &loop,
     };
     listener.tcp.listen();
+    defer listener.deinit();
 
-    var prev_metric = loop.metric;
-    var i: usize = 1;
-    while (true) : (i +%= 1) {
-        loop.runFor(1000) catch |err| switch (err) {
-            error.SignalInterrupt => {},
-            else => return err,
-        };
-        if (signal.get()) |sig| switch (sig) {
-            posix.SIG.TERM, posix.SIG.INT => break,
-            else => {},
-        };
-
-        log.debug("run: {} bytes: {} MB: {} ops: {} active: {}", .{
-            i,
-            listener.total_bytes,
-            listener.total_bytes / 1000_000,
-            loop.metric.processed_op -% prev_metric.processed_op,
-            loop.metric.active_op,
-        });
-        listener.total_bytes = 0;
-        prev_metric = loop.metric;
+    while (true) {
+        try loop.tick();
     }
-
-    log.debug("deinit", .{});
-    listener.deinit();
 }
 
 const Listener = struct {
@@ -73,7 +50,7 @@ const Listener = struct {
         errdefer self.allocator.destroy(conn);
         conn.* = .init(self, fd);
         self.connections.putAssumeCapacity(conn, {});
-        conn.recv();
+        try conn.sendfile();
     }
 
     fn onError(_: *Self, err: anyerror) void {
@@ -94,11 +71,14 @@ const Listener = struct {
     }
 };
 
+var cwd: std.fs.Dir = undefined;
+
 const Connection = struct {
     const Self = @This();
 
     listener: *Listener,
     tcp: io.tcp.Connection(Self, "tcp", onRecv, onSend, onError),
+    file: io.File(Self, "file", onOpen, onRead, onWrite, onError),
 
     buffer: [1024 * 64]u8 = undefined,
     recv_bytes: u32 = 0,
@@ -107,26 +87,31 @@ const Connection = struct {
         return .{
             .listener = listener,
             .tcp = .init(listener.loop, fd),
+            .file = .init(listener.loop, cwd.fd),
         };
     }
 
-    fn recv(self: *Self) void {
-        self.tcp.recvInto(&self.buffer);
+    fn sendfile(self: *Self) !void {
+        try self.file.openRead("test/sendfile.zig");
     }
 
-    fn onRecv(self: *Self, data: []u8) !void {
-        const n: u32 = @intCast(data.len);
-        self.listener.total_bytes += n;
-        self.recv_bytes = n;
-        self.tcp.send(self.buffer[0..self.recv_bytes]);
+    fn onRecv(_: *Self, _: []u8) !void {
+        unreachable;
     }
 
-    fn onSend(self: *Self) !void {
-        self.recv();
+    fn onSend(_: *Self) !void {
+        log.debug("onSend", .{});
+        //unreachable;
     }
 
     fn onError(self: *Self, err: anyerror) void {
         log.err("connection close {}", .{err});
         self.listener.destroy(self);
     }
+
+    fn onOpen(self: *Self) !void {
+        self.tcp.sendfile(self.file.fd, 0, 1024 * 1024);
+    }
+    fn onRead(_: *Self, _: []u8) !void {}
+    fn onWrite(_: *Self, _: []const u8) !void {}
 };

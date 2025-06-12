@@ -125,6 +125,7 @@ pub fn build(b: *std.Build) void {
         "tcp_echo_client",
         "http_client",
         "https_client",
+        "sendfile",
     };
     inline for (examples) |path| {
         const source_file = "test/" ++ path ++ ".zig";

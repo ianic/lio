@@ -53,7 +53,7 @@ const Client = struct {
     allocator: mem.Allocator,
     loop: *io.Loop,
     connector: *Connector,
-    conn: io.tls.Connection(Self, "conn", onRecv, onClose),
+    conn: io.tls.Connection(Self, "conn", onSend, onRecv, onError),
     host: []const u8,
 
     pub fn init(
@@ -85,6 +85,7 @@ const Client = struct {
         recv_buf: []const u8,
     ) !void {
         self.conn = try .init(self.allocator, self.loop, fd, tls_conn, recv_buf);
+        errdefer self.conn.deinit();
         self.conn.tcp.recv_timeout = 1000;
         try self.get(self.host);
         self.allocator.destroy(self.connector);
@@ -96,13 +97,19 @@ const Client = struct {
         try self.conn.send(request);
     }
 
-    fn onRecv(self: *Self, data: []const u8) !void {
-        std.debug.print("onRecv: {} recv_buf.len: {}\n", .{ data.len, self.conn.recv_buf.buffer.len });
+    fn onSend(self: *Self) !void {
+        self.conn.recv();
     }
 
-    fn onClose(_: *Self, err: anyerror) void {
+    fn onRecv(self: *Self, data: []const u8) !void {
+        std.debug.print("onRecv: {} recv_buf.len: {}\n", .{ data.len, self.conn.recv_buf.buffer.len });
+        self.conn.recv();
+    }
+
+    fn onError(self: *Self, err: anyerror) void {
         if (err != error.TimerExpired)
             log.debug("connection close {}", .{err});
+        self.conn.deinit();
     }
 
     fn onConnectError(self: *Self, err: anyerror) void {
