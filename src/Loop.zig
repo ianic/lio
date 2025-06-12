@@ -169,7 +169,7 @@ fn processCompletions(self: *Loop) void {
                 switch (cqe.user_data) {
                     rsv_user_data.none => {
                         success(cqe) catch |err| {
-                            log.debug("cqe: res: {x}, user_data: {x}, err: {}", .{ cqe.res, cqe.user_data, err });
+                            log.debug("failed cqe: res: {x}, user_data: {x}, err: {}", .{ cqe.res, cqe.user_data, err });
                         };
                     },
                     rsv_user_data.skip_fail => {},
@@ -289,14 +289,10 @@ pub fn socket(
     socket_type: u32,
 ) PrepareError!void {
     try self.ensureSqCapacity(1);
-    _, const user_data = try self.acquireOp(parent_field_ptr, struct {
-        fn callback(_: *Loop, op: Op, cqe: linux.io_uring_cqe) void {
-            onComplete(
-                @alignCast(@fieldParentPtr(parent_field_name, op.ref orelse return)),
-                if (success(cqe)) @intCast(cqe.res) else |err| err,
-            );
-        }
-    }.callback);
+    _, const user_data = try self.acquireOp(
+        parent_field_ptr,
+        Op.callbacks.fd(Parent, onComplete, parent_field_name),
+    );
     _ = self.ring.socket_direct_alloc(user_data, domain, socket_type, 0, 0) catch unreachable;
 }
 
@@ -313,15 +309,10 @@ pub fn listen(
     opt: std.net.Address.ListenOptions,
 ) PrepareError!void {
     try self.ensureSqCapacity(if (opt.reuse_address) 4 else 2);
-    _, const user_data = try self.acquireOp(parent_field_ptr, struct {
-        fn callback(_: *Loop, op: Op, cqe: linux.io_uring_cqe) void {
-            onComplete(
-                @alignCast(@fieldParentPtr(parent_field_name, op.ref.?)),
-                if (success(cqe)) {} else |err| err,
-            );
-        }
-    }.callback);
-
+    _, const user_data = try self.acquireOp(
+        parent_field_ptr,
+        Op.callbacks.simple(Parent, onComplete, parent_field_name),
+    );
     var sqe: *linux.io_uring_sqe = undefined;
     // Hardlink ensures that the last operation will get meaningful error. With
     // (soft)link in the case of error in bind onComplete will always get
@@ -366,15 +357,10 @@ pub fn connect(
     connect_timeout: ?*timespec,
 ) PrepareError!void {
     try self.ensureSqCapacity(2);
-    _, const user_data = try self.acquireOp(parent_field_ptr, struct {
-        fn callback(_: *Loop, op: Op, cqe: linux.io_uring_cqe) void {
-            onComplete(
-                @alignCast(@fieldParentPtr(parent_field_name, op.ref.?)),
-                if (success(cqe)) {} else |err| err,
-            );
-        }
-    }.callback);
-
+    _, const user_data = try self.acquireOp(
+        parent_field_ptr,
+        Op.callbacks.simple(Parent, onComplete, parent_field_name),
+    );
     var sqe = self.ring.connect(user_data, fd, &addr.any, addr.getOsSockLen()) catch unreachable;
     sqe.flags |= linux.IOSQE_FIXED_FILE;
     if (connect_timeout) |t| {
@@ -393,15 +379,10 @@ pub fn accept(
     fd: linux.fd_t,
 ) PrepareError!void {
     try self.ensureSqCapacity(1);
-    _, const user_data = try self.acquireOp(parent_field_ptr, struct {
-        fn callback(_: *Loop, op: Op, cqe: linux.io_uring_cqe) void {
-            onComplete(
-                @alignCast(@fieldParentPtr(parent_field_name, op.ref.?)),
-                if (success(cqe)) @intCast(cqe.res) else |err| err,
-            );
-        }
-    }.callback);
-
+    _, const user_data = try self.acquireOp(
+        parent_field_ptr,
+        Op.callbacks.fd(Parent, onComplete, parent_field_name),
+    );
     var sqe = self.ring.accept_direct(user_data, fd, null, null, 0) catch unreachable;
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 }
@@ -421,15 +402,10 @@ pub fn recv(
     buffer: []u8,
 ) PrepareError!void {
     try self.ensureSqCapacity(1);
-    _, const user_data = try self.acquireOp(parent_field_ptr, struct {
-        fn callback(_: *Loop, op: Op, cqe: linux.io_uring_cqe) void {
-            onComplete(
-                @alignCast(@fieldParentPtr(parent_field_name, op.ref.?)),
-                if (success(cqe)) @intCast(cqe.res) else |err| err,
-            );
-        }
-    }.callback);
-
+    _, const user_data = try self.acquireOp(
+        parent_field_ptr,
+        Op.callbacks.len(Parent, onComplete, parent_field_name),
+    );
     var sqe = self.ring.recv(user_data, fd, .{ .buffer = buffer }, 0) catch unreachable;
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 }
@@ -486,15 +462,10 @@ pub fn send(
     buffer: []const u8,
 ) PrepareError!void {
     try self.ensureSqCapacity(1);
-    _, const user_data = try self.acquireOp(parent_field_ptr, struct {
-        fn callback(_: *Loop, op: Op, cqe: linux.io_uring_cqe) void {
-            onComplete(
-                @alignCast(@fieldParentPtr(parent_field_name, op.ref.?)),
-                if (success(cqe)) @intCast(cqe.res) else |err| err,
-            );
-        }
-    }.callback);
-
+    _, const user_data = try self.acquireOp(
+        parent_field_ptr,
+        Op.callbacks.len(Parent, onComplete, parent_field_name),
+    );
     var sqe = self.ring.send(user_data, fd, buffer, linux.MSG.WAITALL | linux.MSG.NOSIGNAL) catch unreachable;
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 }
@@ -673,7 +644,10 @@ pub fn openAt(
     mode: linux.mode_t,
 ) PrepareError!void {
     try self.ensureSqCapacity(1);
-    _, const user_data = try self.acquireOp(parent_field_ptr, Op.callbacks.fd(Parent, onComplete, parent_field_name));
+    _, const user_data = try self.acquireOp(
+        parent_field_ptr,
+        Op.callbacks.fd(Parent, onComplete, parent_field_name),
+    );
     _ = self.ring.openat_direct(user_data, dir_fd, path, flags, mode, linux.IORING_FILE_INDEX_ALLOC) catch unreachable;
 }
 
@@ -690,7 +664,10 @@ pub fn write(
     offset: u64,
 ) PrepareError!void {
     try self.ensureSqCapacity(1);
-    _, const user_data = try self.acquireOp(parent_field_ptr, Op.callbacks.len(Parent, onComplete, parent_field_name));
+    _, const user_data = try self.acquireOp(
+        parent_field_ptr,
+        Op.callbacks.len(Parent, onComplete, parent_field_name),
+    );
     var sqe = self.ring.write(user_data, fd, buffer, offset) catch unreachable;
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 }
@@ -708,8 +685,10 @@ pub fn sendfile(
     len: u32,
 ) PrepareError!void {
     try self.ensureSqCapacity(2);
-    _, const user_data = try self.acquireOp(parent_field_ptr, Op.callbacks.len(Parent, onComplete, parent_field_name));
-
+    _, const user_data = try self.acquireOp(
+        parent_field_ptr,
+        Op.callbacks.len(Parent, onComplete, parent_field_name),
+    );
     const SPLICE_F_NONBLOCK = 0x02;
     const no_offset = std.math.maxInt(u64);
     var sqe = self.ring.splice(rsv_user_data.none, fd_in, offset, pipe_fds[1], no_offset, len) catch unreachable;
