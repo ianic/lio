@@ -2,7 +2,8 @@ const std = @import("std");
 const mem = std.mem;
 const assert = std.debug.assert;
 const testing = std.testing;
-const SocketType = @import("main.zig").SocketType;
+
+pub const SocketType = @import("socket_type.zig").SocketType;
 
 pub const Parser = struct {
     const Self = @This();
@@ -67,18 +68,18 @@ pub const Parser = struct {
     }
 };
 
-const Traffic = union(enum) {
+pub const Traffic = union(enum) {
     command: Command,
     message: Message,
 };
 
-const Frame = struct {
+pub const Frame = struct {
     flags: Flags,
     payload: []const u8,
     len: u64,
 };
 
-const Greeting = struct {
+pub const Greeting = struct {
     minor: u8,
     major: u8,
     security_mechanism: []const u8,
@@ -86,7 +87,7 @@ const Greeting = struct {
 
     const len = 64;
 
-    pub fn parse(buf: []const u8) !?Greeting {
+    fn parse(buf: []const u8) !?Greeting {
         if (buf.len < Greeting.len) return null;
         if (buf[0] != 0xff or buf[9] != 0x7f) return error.InvalidGreetingSignature;
         for (33..64) |i| if (buf[i] != 0) return error.InvalidGreetingFiller;
@@ -99,7 +100,7 @@ const Greeting = struct {
     }
 };
 
-const Command = union(enum) {
+pub const Command = union(enum) {
     ready: Ready,
     err: []const u8, // reason
     subscribe: []const u8, //subscription
@@ -190,18 +191,18 @@ pub const Message = struct {
         return self.payload[0..self.data_pos];
     }
 
-    pub fn frames(self: Self) Frames {
-        return Frames{ .rdr = Reader{ .buffer = self.payload } };
+    pub fn frames(self: Self) FramesIterator {
+        return FramesIterator{ .rdr = Reader{ .buffer = self.payload } };
     }
 
-    pub fn dataFrames(self: Self) Frames {
-        return Frames{ .rdr = Reader{ .buffer = self.payload[self.data_pos..] } };
+    pub fn dataFrames(self: Self) FramesIterator {
+        return FramesIterator{ .rdr = Reader{ .buffer = self.payload[self.data_pos..] } };
     }
 
-    pub const Frames = struct {
+    pub const FramesIterator = struct {
         rdr: Reader,
 
-        pub fn next(self: *Frames) ?Frame {
+        pub fn next(self: *FramesIterator) ?Frame {
             return self.rdr.frame() catch unreachable;
         }
     };
@@ -293,10 +294,10 @@ const Reader = struct {
 
 test {
     _ = Flags;
-    _ = @import("main.zig");
+    _ = @import("socket_type.zig");
 }
 
-const hexToBytes = @import("main.zig").hexToBytes;
+const hexToBytes = @import("testu.zig").hexToBytes;
 
 test "Parser.frame" {
     var rdr = Reader{ .buffer = &testdata.greeting };
@@ -448,3 +449,79 @@ const testdata = struct {
         \\ 36 37 38 39
     );
 };
+
+/// Returns greeting and ready messages.
+pub fn handshake(
+    allocator: mem.Allocator,
+    socket_type: SocketType,
+    identity: []const u8,
+) ![]u8 {
+    // major: 3, minor: 1, security machanism: NULL, is server: false
+    const greeting = hexToBytes(
+        \\ ff 00 00 00 00 00 00 00 01 7f 03 01 4e 55 4c 4c
+        \\ 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        \\ 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        \\ 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+    );
+    const ready = "\x05READY"; // 1 bytes is string size, then string
+    const socket_type_key = "\x0bSocket-Type";
+    const identity_key = "\x08Identity";
+    const socket_type_name = socket_type.string();
+
+    const size: u64 =
+        ready.len +
+        socket_type_key.len + 4 + socket_type_name.len +
+        if (identity.len == 0) 0 else identity_key.len + 4 + identity.len;
+    const is_long_size = size > 255;
+    const ready_frame_len: usize = if (is_long_size) 1 + 8 + size else 1 + 1 + size;
+
+    const buf = try allocator.alloc(u8, greeting.len + ready_frame_len);
+    var fbs = std.io.fixedBufferStream(buf);
+    var w = fbs.writer();
+
+    try w.writeAll(&greeting);
+    try w.writeByte(0x04);
+    if (is_long_size)
+        try w.writeInt(u64, size, .big)
+    else
+        try w.writeByte(@intCast(size));
+    try w.writeAll(ready);
+    try w.writeAll(socket_type_key);
+    try w.writeInt(u32, @intCast(socket_type_name.len), .big);
+    try w.writeAll(socket_type_name);
+    if (identity.len > 0) {
+        try w.writeAll(identity_key);
+        try w.writeInt(u32, @intCast(identity.len), .big);
+        try w.writeAll(identity);
+    }
+
+    return buf;
+}
+
+test "handshake" {
+    {
+        const expected = hexToBytes(
+            // greeting
+            \\ ff 00 00 00 00 00 00 00 01 7f 03 01 4e 55 4c 4c
+            \\ 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+            \\ 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+            \\ 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+            // ready, socket-type: rep
+            \\ 04 19 05 52 45 41 44 59 0b 53 6f 63 6b 65 74 2d
+            \\ 54 79 70 65 00 00 00 03 52 45 50
+        );
+        const actual = try handshake(testing.allocator, .rep, &.{});
+        defer testing.allocator.free(actual);
+        try testing.expectEqualSlices(u8, &expected, actual);
+    }
+    {
+        const actual = try handshake(testing.allocator, .rep, "localhost");
+        defer testing.allocator.free(actual);
+        const header = "\x04\x2f\x05READY";
+        try testing.expectEqualSlices(u8, header, actual[64..][0..header.len]);
+        const socket_type_kv = "\x0bSocket-Type\x00\x00\x00\x03REP";
+        try testing.expectEqualSlices(u8, socket_type_kv, actual[64 + 8 ..][0..socket_type_kv.len]);
+        const identity_kv = "\x08Identity\x00\x00\x00\x09localhost";
+        try testing.expectEqualSlices(u8, identity_kv, actual[actual.len - identity_kv.len ..]);
+    }
+}

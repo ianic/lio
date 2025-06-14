@@ -429,14 +429,14 @@ test "sizeOf" {
 
         fn onConnect(_: *Self, _: linux.fd_t) !void {}
         fn onConnectError(_: *Self, _: anyerror) void {}
-        fn onSend(_: *Self, _: []const u8) !void {}
+        fn onSend(_: *Self) !void {}
         fn onRecv(_: *Self, _: []u8) !void {}
         fn onClose(_: *Self, _: anyerror) void {}
     };
 
-    try std.testing.expectEqual(232, @sizeOf(Client));
+    try std.testing.expectEqual(256, @sizeOf(Client));
     try std.testing.expectEqual(144, @sizeOf(Connector(Client, "connector", Client.onConnect, Client.onConnectError)));
-    try std.testing.expectEqual(88, @sizeOf(Connection(Client, "conn", Client.onRecv, Client.onSend, Client.onClose)));
+    try std.testing.expectEqual(112, @sizeOf(Connection(Client, "conn", Client.onRecv, Client.onSend, Client.onClose)));
 
     try std.testing.expectEqual(112, @sizeOf(std.net.Address));
     try std.testing.expectEqual(16, @sizeOf(linux.kernel_timespec));

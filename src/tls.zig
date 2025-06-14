@@ -193,14 +193,15 @@ test "sizeOf" {
         const Self = @This();
 
         connector: *io.tls.Connector(Self, onConnect, onError),
-        conn: io.tls.Connection(Self, "conn", onRecv, onError),
+        conn: io.tls.Connection(Self, "conn", onSend, onRecv, onError),
 
         fn onConnect(_: *Self, _: linux.fd_t, _: tls.nonblock.Connection, _: []const u8) !void {}
         fn onRecv(_: *Self, _: []const u8) !void {}
+        fn onSend(_: *Self) !void {}
         fn onError(_: *Self, _: anyerror) void {}
     };
 
-    try std.testing.expectEqual(336, @sizeOf(Client));
-    try std.testing.expectEqual(67600, @sizeOf(Connector(Client, Client.onConnect, Client.onError)));
-    try std.testing.expectEqual(328, @sizeOf(Connection(Client, "conn", Client.onRecv, Client.onError)));
+    try std.testing.expectEqual(376, @sizeOf(Client));
+    try std.testing.expectEqual(67616, @sizeOf(Connector(Client, Client.onConnect, Client.onError)));
+    try std.testing.expectEqual(368, @sizeOf(Connection(Client, "conn", Client.onSend, Client.onRecv, Client.onError)));
 }
