@@ -126,7 +126,8 @@ const Connection = struct {
     }
 
     fn onError(self: *Self, err: anyerror) void {
-        log.err("connection close {}", .{err});
+        if (err != error.EndOfFile)
+            log.err("connection close {}", .{err});
         self.listener.destroy(self);
     }
 };
