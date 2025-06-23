@@ -55,6 +55,16 @@ pub const Parser = struct {
         return rdy;
     }
 
+    pub fn handshake(self: *Self) !?Handshake {
+        var rdr = self.reader();
+        const grt_buf = rdr.slice(Greeting.len) orelse return null;
+        const grt = try Greeting.parse(grt_buf) orelse return null;
+        const frm = try rdr.frame() orelse return null;
+        const rdy = try Command.Ready.parse(frm) orelse return null;
+        self.pos += rdr.pos;
+        return .{ .greeting = grt, .ready = rdy };
+    }
+
     fn reader(self: *Self) Reader {
         return .{ .buffer = self.buffer[self.pos..] };
     }
@@ -71,6 +81,11 @@ pub const Parser = struct {
 pub const Traffic = union(enum) {
     command: Command,
     message: Message,
+};
+
+pub const Handshake = struct {
+    greeting: Greeting,
+    ready: Command.Ready,
 };
 
 pub const Frame = struct {
@@ -255,7 +270,7 @@ const Reader = struct {
     }
 
     // 4 bytes size + data
-    fn value(self: anytype) ?[]const u8 {
+    fn value(self: *Self) ?[]const u8 {
         var buf = self.buffer[self.pos..];
         if (buf.len < 4) return null;
         const size = mem.readInt(u32, buf[0..4], .big);
@@ -263,6 +278,13 @@ const Reader = struct {
         if (buf.len < size) return null;
         self.pos += 4 + size;
         return buf[0..size];
+    }
+
+    fn slice(self: *Self, len: usize) ?[]const u8 {
+        var buf = self.buffer[self.pos..];
+        if (buf.len < len) return null;
+        self.pos += len;
+        return buf[0..len];
     }
 
     fn unparsed(self: Self) []const u8 {
@@ -358,7 +380,35 @@ test "Parser.ready" {
     }
 }
 
-test "Parse.message" {
+test "Parser.handshake" {
+    var hs_buf = testdata.greeting ++ testdata.ready_with_identity;
+    // Partial buffer
+    for (0..hs_buf.len) |i| {
+        const buf = hs_buf[0..i];
+        var p = Parser{ .buffer = buf };
+        try testing.expect(try p.handshake() == null);
+        try testing.expectEqual(0, p.pos);
+        try testing.expectEqualSlices(u8, buf, p.unparsed());
+    }
+    // Full handshake + some more data
+    var p = Parser{ .buffer = &hs_buf ++ "012345678901" };
+    const hs = (try p.handshake()).?;
+
+    const gr = hs.greeting;
+    try testing.expectEqual(3, gr.major);
+    try testing.expectEqual(1, gr.minor);
+    try testing.expectEqualStrings("NULL", gr.security_mechanism);
+    try testing.expectEqual(false, gr.is_server);
+
+    const rdy = hs.ready;
+    try testing.expectEqual(.rep, rdy.socket_type);
+    try testing.expectEqualStrings("Pero Zdero", rdy.identity);
+
+    try testing.expectEqual(114, p.pos);
+    try testing.expectEqual(12, p.unparsed().len);
+}
+
+test "Parser.message" {
     var msg_data = testdata.has_more_small ++
         testdata.separator ++
         testdata.last_big;
@@ -498,7 +548,7 @@ pub fn handshake(
     return buf;
 }
 
-test "handshake" {
+test "handshake create" {
     {
         const expected = hexToBytes(
             // greeting
@@ -523,5 +573,32 @@ test "handshake" {
         try testing.expectEqualSlices(u8, socket_type_kv, actual[64 + 8 ..][0..socket_type_kv.len]);
         const identity_kv = "\x08Identity\x00\x00\x00\x09localhost";
         try testing.expectEqualSlices(u8, identity_kv, actual[actual.len - identity_kv.len ..]);
+    }
+}
+
+pub const ping = "\x04\x07\x04PING\x00\x00";
+
+pub fn pong(buf: []u8, context: []const u8) []const u8 {
+    assert(context.len <= 16);
+    assert(buf.len >= 7 + context.len);
+    @memcpy(buf[0..7], "\x04\x05\x04PONG");
+    if (context.len == 0)
+        return buf[0..7];
+    @memcpy(buf[7..][0..context.len], context);
+    buf[1] += @intCast(context.len);
+    return buf[0 .. 7 + context.len];
+}
+
+test "pong" {
+    var buf: [23]u8 = undefined;
+    {
+        var p = Parser{ .buffer = pong(&buf, &.{}) };
+        const pg = (try p.traffic()).?.command.pong;
+        try testing.expectEqual(0, pg.context.len);
+    }
+    {
+        var p = Parser{ .buffer = pong(&buf, "0123456789") };
+        const pg = (try p.traffic()).?.command.pong;
+        try testing.expectEqualStrings("0123456789", pg.context);
     }
 }

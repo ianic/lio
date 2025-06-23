@@ -25,6 +25,9 @@ pub const UnusedDataBuffer = struct {
             // nothing to append to
             return data;
         }
+        if (data.len == 0) {
+            return self.buffer;
+        }
         const old_len = self.buffer.len;
         self.buffer = try allocator.realloc(self.buffer, old_len + data.len);
         @memcpy(self.buffer[old_len..], data);
