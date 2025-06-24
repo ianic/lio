@@ -53,5 +53,6 @@ pub const UnusedDataBuffer = struct {
 
     pub fn deinit(self: *Self, allocator: mem.Allocator) void {
         allocator.free(self.buffer);
+        self.buffer = &.{};
     }
 };

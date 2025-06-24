@@ -87,6 +87,17 @@ pub fn Connector(
     };
 }
 
+pub fn isConnectionCloseError(err: anyerror) bool {
+    return switch (err) {
+        // TCP Connection read/write errors
+        error.EndOfFile, // Clean connection close on read
+        error.BrokenPipe,
+        error.ConnectionResetByPeer, // ECONNRESET
+        => true,
+        else => false,
+    };
+}
+
 /// Application can retry on network error
 pub fn isNetworkError(err: anyerror) bool {
     return switch (err) {

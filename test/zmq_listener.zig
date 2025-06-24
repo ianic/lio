@@ -48,7 +48,7 @@ const Listener = struct {
     allocator: mem.Allocator,
     loop: *io.Loop,
     tcp: io.tcp.Listener(Self, "tcp", onAccept, onError),
-    connections: std.AutoArrayHashMapUnmanaged(*Connection, void) = .empty,
+    connections: std.ArrayListUnmanaged(*Connection) = .empty,
     handshake: []const u8,
 
     fn init(allocator: mem.Allocator, loop: *io.Loop, addr: net.Address, socket_type: zmq.SocketType) !Self {
@@ -69,24 +69,30 @@ const Listener = struct {
         const conn = try self.allocator.create(Connection);
         errdefer self.allocator.destroy(conn);
 
-        conn.* = .init(self, fd);
-        self.connections.putAssumeCapacity(conn, {});
+        //log.debug("onAccept connections: {}", .{self.connections.items.len});
+        conn.* = .init(self, fd, self.connections.items.len);
+        self.connections.appendAssumeCapacity(conn);
         conn.upgrade(self.handshake);
     }
 
-    fn onError(_: *Self, err: anyerror) void {
+    fn onError(self: *Self, err: anyerror) void {
         log.err("tcp listener error {}", .{err});
-        // self.tcp.listen();
+        self.tcp.listen();
     }
 
     fn destroy(self: *Self, conn: *Connection) void {
-        assert(self.connections.fetchSwapRemove(conn) != null);
+        // log.debug("destroy conn.idx: {}, connections: {}", .{ conn.idx, self.connections.items.len });
+        assert(self.connections.swapRemove(conn.idx) == conn);
+        if (conn.idx < self.connections.items.len) {
+            // Update idx of the item which is swapped to the position of removed one
+            self.connections.items[conn.idx].idx = conn.idx;
+        }
         conn.deinit();
         self.allocator.destroy(conn);
     }
 
     fn deinit(self: *Self) void {
-        for (self.connections.keys()) |conn| {
+        for (self.connections.items) |conn| {
             conn.deinit();
             self.allocator.destroy(conn);
         }
@@ -98,141 +104,56 @@ const Listener = struct {
 const Connection = struct {
     const Self = @This();
 
-    allocator: mem.Allocator,
-    listener: *Listener,
-    tcp: io.tcp.Connection2(Self, "tcp"),
-    recv_buf: io.UnusedDataBuffer,
-    ping_op: ?u32 = null,
-    heartbeat_interval: u32 = 5 * 1000, // send ping after
-    recv_ops_count: usize = 0, // number of recv operations after ping is send
-    pong_buf: [23]u8 = undefined,
+    parent: *Listener,
+    idx: usize, // index in parent.connections
+    conn: zmq.Connection(Self, "conn", onConnect, onMessage, onSubscribe, onUnsubscribe, onError),
 
-    pub fn init(listener: *Listener, fd: linux.fd_t) Self {
+    pub fn init(parent: *Listener, fd: linux.fd_t, idx: usize) Self {
         return .{
-            .allocator = listener.allocator,
-            .listener = listener,
-            .tcp = .init(listener.loop, fd, .{ .onRecv = onHandshakeRecv, .onSend = onHandshakeSend, .onError = onError }),
-            .recv_buf = .{},
+            .parent = parent,
+            .idx = idx,
+            .conn = .init(parent.allocator, parent.loop, fd),
         };
     }
 
     fn upgrade(self: *Self, handshake: []const u8) void {
-        self.tcp.send(handshake);
+        self.conn.upgrade(handshake);
     }
 
-    fn onHandshakeSend(self: *Self) !void {
-        self.tcp.recv_timeout = 10 * 1000;
-        self.tcp.recv();
-    }
-
-    fn onHandshakeRecv(self: *Self, data: []u8) !void {
-        var parser = zmq.protocol.Parser{ .buffer = try self.recv_buf.append(self.allocator, data) };
-        const hs = try parser.handshake() orelse {
-            try self.recv_buf.set(self.allocator, parser.unparsed());
-            self.tcp.recv();
-            return;
-        };
-        log.debug("connected: {}", .{hs.ready.socket_type});
-        self.tcp.recv_timeout = 0;
-        self.tcp.callbacks = .{ .onRecv = onRecv, .onSend = onSend, .onError = onError };
-        try self.recv_buf.set(self.allocator, parser.unparsed());
-        if (parser.unparsed().len > 0) {
-            try self.onRecv(&.{});
-        } else {
-            self.tcp.recv();
-        }
-        self.setHeartbeatTimeout();
-    }
-
-    fn setHeartbeatTimeout(self: *Self) void {
-        if (self.heartbeat_interval == 0) return;
-        self.listener.loop.timeout(Self, onHeartbeatTimeout, "ping_op", &self.ping_op, self.heartbeat_interval) catch |err| {
-            log.err("ping {}", .{err});
-            self.tcp.close();
-        };
-        self.recv_ops_count = 0;
-    }
-
-    fn onHeartbeatTimeout(self: *Self) void {
-        if (self.recv_ops_count == 0 and self.tcp.ready()) {
-            log.debug("sending ping", .{});
-            self.tcp.send(zmq.protocol.ping);
-        }
-        self.setHeartbeatTimeout();
-    }
-
-    fn onSend(self: *Self) !void {
-        // TODO: da bi pozvao callback moram znati da li sam slao ping, subscribe ili neku drugu komandu
-        // ovo je server strana pa nikada ne salje subscribe, ali salje ping koji nije application triggered
+    fn onConnect(self: *Self) !void {
+        // log.debug("onConnect", .{});
         _ = self;
     }
 
-    fn onRecv(self: *Self, data: []u8) !void {
-        self.recv_ops_count +|= 1;
-        var parser = zmq.protocol.Parser{ .buffer = try self.recv_buf.append(self.allocator, data) };
-        while (try parser.traffic()) |tr| {
-            switch (tr) {
-                .message => |msg| {
-                    log.debug("onRecv message len {d}", .{msg.payload.len});
-                    var iter = msg.frames();
-                    while (iter.next()) |frm| {
-                        log.debug("onRecv frame ({d}): '{s}'", .{ frm.len, frm.payload });
-                    }
-                },
-                .command => |cmd| {
-                    switch (cmd) {
-                        .ping => |pi| {
-                            // respond with pong
-                            if (self.tcp.ready()) {
-                                log.debug("onRecv ping ttl: {}, context: {x}", .{ pi.ttl, pi.context });
-                                const pg = zmq.protocol.pong(&self.pong_buf, pi.context);
-                                self.tcp.send(pg);
-                            }
-                        },
-                        .pong => |pg| {
-                            log.debug("onRecv pong context: {x}", .{pg.context});
-                        },
-                        .err => |reason| {
-                            log.err("cmd close {s}", .{reason});
-                            self.tcp.close();
-                            return;
-                        },
-                        .subscribe => {},
-                        .cancel => {},
-                        .ready => {
-                            // this command is valid only during handshake
-                            self.tcp.close();
-                        },
-                    }
-                },
-            }
-        }
-        try self.recv_buf.set(self.allocator, parser.unparsed());
-        self.tcp.recv();
+    fn onMessage(self: *Self, msg: zmq.protocol.Message) !void {
+        _ = self;
+        _ = msg;
+
+        // log.debug("onMessage message len {d}", .{msg.payload.len});
+        // var iter = msg.frames();
+        // while (iter.next()) |frm| {
+        //     log.debug("  frame ({d}): '{s}'", .{ frm.len, frm.payload });
+        // }
+    }
+
+    fn onSubscribe(self: *Self, subscription: []const u8) !void {
+        _ = self;
+        _ = subscription;
+    }
+
+    fn onUnsubscribe(self: *Self, subscription: []const u8) !void {
+        _ = self;
+        _ = subscription;
     }
 
     fn onError(self: *Self, err: anyerror) void {
-        switch (err) {
-            error.TimerExpired => {
-                if (self.tcp.send_op == null) {
-                    self.tcp.send(zmq.protocol.ping);
-                }
-                return;
-            },
-            error.EndOfFile => {},
-            else => {
-                log.err("connection close {}", .{err});
-            },
+        if (!io.tcp.isConnectionCloseError(err)) {
+            log.err("connection {}", .{err});
         }
-        self.listener.destroy(self);
+        self.parent.destroy(self);
     }
 
-    pub fn deinit(self: *Self) void {
-        if (self.ping_op) |op| self.listener.loop.detach(op);
-        self.recv_buf.deinit(self.allocator);
-    }
-
-    pub fn ready(self: *Self) bool {
-        return self.tcp.ready();
+    fn deinit(self: *Self) void {
+        self.conn.deinit();
     }
 };
