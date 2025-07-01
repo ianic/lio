@@ -68,6 +68,10 @@
         .tls = .{
             .path = "../tls.zig",
         },
+        .zimq = .{
+            .url = "git+https://github.com/uyha/zimq.git#c8ba4645c7b980068fd55350b306e5c0de0557d5",
+            .hash = "zimq-0.0.0-nw1ioOOjAQBVn_MV41-w-MLqhewZQ7D3SZsgs_xAQqDv",
+        },
     },
 
     // Specifies the set of files and directories that are included in this package.

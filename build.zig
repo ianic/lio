@@ -119,6 +119,11 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_lib_unit_tests.step);
     test_step.dependOn(&run_exe_unit_tests.step);
 
+    const zimq = b.dependency("zimq", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Build all from test/ path
     const examples = [_][]const u8{
         "tcp_echo_server",
@@ -127,6 +132,7 @@ pub fn build(b: *std.Build) void {
         "https_client",
         "sendfile",
         "zmq_listener",
+        "zimq",
     };
     inline for (examples) |path| {
         const source_file = "test/" ++ path ++ ".zig";
@@ -140,6 +146,7 @@ pub fn build(b: *std.Build) void {
         test_exe.linkLibC();
         test_exe.root_module.addImport("lio", lib_mod);
         test_exe.root_module.addImport("tls", tls_module);
+        test_exe.root_module.addImport("zimq", zimq.module("zimq"));
         b.installArtifact(test_exe);
     }
 }

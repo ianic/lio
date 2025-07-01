@@ -81,7 +81,7 @@ const Listener = struct {
     }
 
     fn destroy(self: *Self, conn: *Connection) void {
-        // log.debug("destroy conn.idx: {}, connections: {}", .{ conn.idx, self.connections.items.len });
+        //log.debug("destroy conn.idx: {}, connections: {}", .{ conn.idx, self.connections.items.len });
         assert(self.connections.swapRemove(conn.idx) == conn);
         if (conn.idx < self.connections.items.len) {
             // Update idx of the item which is swapped to the position of removed one
@@ -127,23 +127,23 @@ const Connection = struct {
 
     fn onMessage(self: *Self, msg: zmq.protocol.Message) !void {
         _ = self;
-        _ = msg;
+        //_ = msg;
 
-        // log.debug("onMessage message len {d}", .{msg.payload.len});
-        // var iter = msg.frames();
-        // while (iter.next()) |frm| {
-        //     log.debug("  frame ({d}): '{s}'", .{ frm.len, frm.payload });
-        // }
+        log.debug("onMessage message len {d}", .{msg.payload.len});
+        var iter = msg.frames();
+        while (iter.next()) |frm| {
+            log.debug("  frame ({d}): '{s}' '{x}'", .{ frm.len, frm.body, frm.body });
+        }
     }
 
     fn onSubscribe(self: *Self, subscription: []const u8) !void {
         _ = self;
-        _ = subscription;
+        log.debug("onSubscribe {s}", .{subscription});
     }
 
     fn onUnsubscribe(self: *Self, subscription: []const u8) !void {
         _ = self;
-        _ = subscription;
+        log.debug("onUnsubscribe {s}", .{subscription});
     }
 
     fn onError(self: *Self, err: anyerror) void {
