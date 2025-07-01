@@ -24,7 +24,7 @@ pub const Parser = struct {
         var data_pos: usize = 0;
         while (frm.flags.more) {
             frm = try rdr.frame() orelse return null;
-            if (frm.payload.len == 0 and data_pos == 0) data_pos = rdr.pos;
+            if (frm.body.len == 0 and data_pos == 0) data_pos = rdr.pos;
             if (frm.flags.command) return error.InvalidFragmentation;
         }
 
@@ -90,8 +90,41 @@ pub const Handshake = struct {
 
 pub const Frame = struct {
     flags: Flags,
-    payload: []const u8,
-    len: u64,
+    body: []const u8, // body part, without header (flags, len)
+    len: u64, // complete frame len (header + body)
+
+    pub fn bufWrite(buf: []u8, data: []const u8, more: bool) []u8 {
+        const pos = writeHeader(buf, data.len, more);
+        @memcpy(buf[pos..][0..data.len], data);
+        return buf[0 .. pos + data.len];
+    }
+
+    fn writeHeader(buf: []u8, data_len: usize, more: bool) usize {
+        const flags = Flags{ .more = more, .long = data_len > 0xff, .command = false };
+        buf[0] = @bitCast(flags);
+        if (flags.long)
+            mem.writeInt(u64, buf[1..9], data_len, .big)
+        else
+            buf[1] = @intCast(data_len);
+        const pos: usize = if (flags.long) 9 else 2;
+        return pos;
+    }
+
+    pub fn length(data_len: usize) usize {
+        if (data_len > 0xff) return data_len + 9;
+        return data_len + 2;
+    }
+
+    /// Allocate buffer for whole frame, write frame header. Return frame buffer
+    /// and header len (position where to write body).
+    ///
+    /// Buffer inside stream is owned by caller.
+    pub fn alloc(allocator: mem.Allocator, data_len: usize) !struct { []u8, usize } {
+        const frame_len = Frame.length(data_len);
+        const buf = try allocator.alloc(u8, frame_len);
+        const pos = writeHeader(buf, data_len, false);
+        return .{ buf, pos };
+    }
 };
 
 pub const Greeting = struct {
@@ -135,11 +168,11 @@ pub const Command = union(enum) {
         resource: []const u8 = &.{},
 
         fn parse(frm: Frame) !?Ready {
-            var rdr = Reader{ .buffer = frm.payload };
+            var rdr = Reader{ .buffer = frm.body };
             if (!mem.eql(u8, "READY", rdr.key() orelse return null)) return error.InvalidCommand;
             var cmd = Ready{
                 .socket_type = undefined,
-                .metadata = frm.payload[rdr.pos..],
+                .metadata = frm.body[rdr.pos..],
             };
             var found_socket_type: bool = false;
             while (rdr.key()) |key| {
@@ -161,7 +194,7 @@ pub const Command = union(enum) {
     };
 
     fn parse(frm: Frame) !?Command {
-        var rdr = Reader{ .buffer = frm.payload };
+        var rdr = Reader{ .buffer = frm.body };
         const name = rdr.key() orelse return null;
         if (mem.eql(u8, "SUBSCRIBE", name))
             return .{
@@ -217,13 +250,17 @@ pub const Message = struct {
     pub const FramesIterator = struct {
         rdr: Reader,
 
+        pub fn init(payload: []const u8) FramesIterator {
+            return .{ .rdr = Reader{ .buffer = payload } };
+        }
+
         pub fn next(self: *FramesIterator) ?Frame {
             return self.rdr.frame() catch unreachable;
         }
     };
 };
 
-const Flags = packed struct {
+pub const Flags = packed struct {
     /// bit 0, more frames to follow
     more: bool,
     /// bit 1, frames size is u8 (0) or u64 (1)
@@ -231,7 +268,7 @@ const Flags = packed struct {
     /// bit 2, this is command frame
     command: bool,
     /// bits 7-3, reserved, must be 0
-    _reserved: u5,
+    _reserved: u5 = 0,
 
     test "parse" {
         var f: Flags = @bitCast(@as(u8, 2));
@@ -308,7 +345,7 @@ const Reader = struct {
         self.pos += len;
         return .{
             .flags = flags,
-            .payload = buf[payload_head..][0..payload_len],
+            .body = buf[payload_head..][0..payload_len],
             .len = len,
         };
     }
@@ -330,7 +367,7 @@ test "Parser.frame" {
     try testing.expect(frm.flags.command);
     try testing.expect(!frm.flags.long);
     try testing.expect(!frm.flags.more);
-    try testing.expectEqual(0x26, frm.payload.len);
+    try testing.expectEqual(0x26, frm.body.len);
 }
 
 test "Parser.greeting" {
@@ -426,14 +463,14 @@ test "Parser.message" {
         var iter = msg.dataFrames();
         const frm = iter.next().?;
         try testing.expectEqual(testdata.last_big.len, frm.len);
-        try testing.expectEqualSlices(u8, &testdata.big_body, frm.payload);
+        try testing.expectEqualSlices(u8, &testdata.big_body, frm.body);
         try testing.expect(iter.next() == null);
     }
     {
         var iter = msg.frames();
-        try testing.expectEqualSlices(u8, testdata.has_more_small[2..], iter.next().?.payload);
-        try testing.expectEqualSlices(u8, testdata.separator[2..], iter.next().?.payload);
-        try testing.expectEqualSlices(u8, &testdata.big_body, iter.next().?.payload);
+        try testing.expectEqualSlices(u8, testdata.has_more_small[2..], iter.next().?.body);
+        try testing.expectEqualSlices(u8, testdata.separator[2..], iter.next().?.body);
+        try testing.expectEqualSlices(u8, &testdata.big_body, iter.next().?.body);
         try testing.expect(iter.next() == null);
     }
 }
