@@ -589,6 +589,36 @@ const BufferWriter = struct {
         @memcpy(self.buffer[self.pos..][0..s.len], s);
         self.pos += s.len;
     }
+
+    pub fn encode(self: *Self, value: anytype) void {
+        const info = @typeInfo(@TypeOf(value));
+        inline for (info.@"struct".fields) |field| {
+            switch (field.type) {
+                inline []const u8, []u8 => self.string(@field(value, field.name)), // string
+                u32 => self.int4(@field(value, field.name)),
+                u64 => self.int8(@field(value, field.name)),
+                else => self.encode(@field(value, field.name)), // inner struct
+            }
+        }
+    }
+
+    pub fn encodedLength(value: anytype) usize {
+        var ret: usize = 0;
+        const info = @typeInfo(@TypeOf(value));
+        inline for (info.@"struct".fields) |field| {
+            ret += switch (field.type) {
+                inline []const u8, []u8 => @field(value, field.name).len + 1,
+                u32 => 4,
+                u64 => 8,
+                else => encodedLength(@field(value, field.name)), // inner struct
+            };
+        }
+        return ret;
+    }
+
+    pub fn content(self: Self) []u8 {
+        return self.buffer[0..self.pos];
+    }
 };
 
 const BufferReader = struct {
@@ -623,4 +653,82 @@ const BufferReader = struct {
         defer self.pos += len;
         return self.buffer[self.pos..][0..len];
     }
+
+    pub fn decodeInto(self: *Self, ptr: anytype) Error!void {
+        const info = @typeInfo(@typeInfo(@TypeOf(ptr)).pointer.child);
+        inline for (info.@"struct".fields) |field| {
+            switch (field.type) {
+                inline []const u8, []u8 => @field(ptr, field.name) = try self.string(), // string
+                u32 => @field(ptr, field.name) = try self.int4(),
+                u64 => @field(ptr, field.name) = try self.int8(),
+                else => try self.decodeInto(&@field(ptr, field.name)), // inner struct
+            }
+        }
+    }
+
+    pub fn decode(self: *Self, T: type) Error!T {
+        var value: T = undefined;
+        const info = @typeInfo(@TypeOf(value));
+        inline for (info.@"struct".fields) |field| {
+            switch (field.type) {
+                inline []const u8, []u8 => @field(value, field.name) = try self.string(), // string
+                u32 => @field(value, field.name) = try self.int4(),
+                u64 => @field(value, field.name) = try self.int8(),
+                else => @field(value, field.name) = try self.decode(field.type), // inner struct
+            }
+        }
+        return value;
+    }
 };
+
+test "reflection" {
+    const value = Control.Pos{
+        .id = 0xaabbccdd,
+        .name = "stream name",
+        .current = .{
+            .sequence = 0x1122334455667788,
+            .timestamp = 0x99aabbccddeeff00,
+        },
+        .tail = .{
+            .sequence = 0x1122334455667788 + 1,
+            .timestamp = 0x99aabbccddeeff00 + 1,
+        },
+        .credit = 0xddeeaadd,
+    };
+
+    const buffer_len = BufferWriter.encodedLength(value);
+    try testing.expectEqual(52, buffer_len);
+    const buffer = try testing.allocator.alloc(u8, buffer_len);
+    defer testing.allocator.free(buffer);
+
+    { // encode
+        var w = BufferWriter{ .buffer = buffer };
+        w.encode(value);
+        try testing.expectEqual(buffer_len, w.pos);
+
+        try testing.expectEqualSlices(
+            u8,
+            &.{
+                0xaa, 0xbb, 0xcc, 0xdd, // id
+                0xb, 0x73, 0x74, 0x72, 0x65, 0x61, 0x6d, 0x20, 0x6e, 0x61, 0x6d, 0x65, // name
+                0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, // current.sequence
+                0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x0, // current.timestamp
+                0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x89, // tail.sequence
+                0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x1, // tail timestamp
+                0xdd, 0xee, 0xaa, 0xdd, // credit
+            },
+            buffer,
+        );
+    }
+    { // decode
+        var r = BufferReader{ .buffer = buffer };
+        const p = try r.decode(Control.Pos);
+        try testing.expectEqualDeep(value, p);
+    }
+    { // decodeInto
+        var p: Control.Pos = undefined;
+        var r = BufferReader{ .buffer = buffer };
+        try r.decodeInto(&p);
+        try testing.expectEqualDeep(value, p);
+    }
+}
