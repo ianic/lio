@@ -114,26 +114,28 @@ pub const Control = union(Kind) {
             if (buffer.len < self.encodedLength()) return error.NoSpaceLeft;
             var w = BufferWriter{ .buffer = buffer };
             w.byte(@intFromEnum(Kind.pos));
-            w.int4(self.id);
-            w.string(self.name);
-            w.int8(self.current.sequence);
-            w.int8(self.current.timestamp);
-            w.int8(self.tail.sequence);
-            w.int8(self.tail.timestamp);
-            w.int4(self.credit);
+            w.encode(self);
+            // w.int4(self.id);
+            // w.string(self.name);
+            // w.int8(self.current.sequence);
+            // w.int8(self.current.timestamp);
+            // w.int8(self.tail.sequence);
+            // w.int8(self.tail.timestamp);
+            // w.int4(self.credit);
             return w.pos;
         }
         pub fn decode(buffer: []const u8) EncodeError!struct { Pos, usize } {
             var r = BufferReader{ .buffer = buffer };
             var p: Pos = undefined;
             assert(try r.byte() == @intFromEnum(Kind.pos));
-            p.id = try r.int4();
-            p.name = try r.string();
-            p.current.sequence = try r.int8();
-            p.current.timestamp = try r.int8();
-            p.tail.sequence = try r.int8();
-            p.tail.timestamp = try r.int8();
-            p.credit = try r.int4();
+            try r.decodeInto(&p);
+            // p.id = try r.int4();
+            // p.name = try r.string();
+            // p.current.sequence = try r.int8();
+            // p.current.timestamp = try r.int8();
+            // p.tail.sequence = try r.int8();
+            // p.tail.timestamp = try r.int8();
+            // p.credit = try r.int4();
             return .{ p, r.pos };
         }
     };
@@ -173,11 +175,8 @@ pub const Control = union(Kind) {
 
     pub const Append = struct {
         stream_name: []const u8,
-        record: Record,
-
-        // pub fn encodedLength(self: Append) usize {}
-        // pub fn encode(self: Append, buffer: []u8) EncodeError!usize {}
-        // pub fn decode(buffer: []const u8) EncodeError!struct { Append, usize } {}
+        sequence: u64,
+        timestamp: u64,
     };
 
     pub const Seek = struct {
@@ -315,7 +314,51 @@ pub const Control = union(Kind) {
     credit: Credit,
     get_pos: GetPos,
     get_tail: GetTail,
+
+    pub fn decode(buffer: []const u8) !Control {
+        var r = BufferReader{ .buffer = buffer };
+        const kind: Kind = tryEnumFromInt(Kind, try r.byte()) orelse return error.InvalidCommand;
+        switch (kind) {
+            inline else => |k| {
+                var c = @unionInit(Control, @tagName(k), undefined);
+                try r.decodeInto(&@field(c, @tagName(k)));
+                return c;
+            },
+        }
+    }
+
+    pub fn encodedLength(c: Control) usize {
+        return 1 + switch (c) {
+            inline else => |t| BufferWriter.encodedLength(t),
+        };
+    }
+
+    pub fn encode(c: Control, buffer: []u8) !void {
+        switch (c) {
+            inline else => |t| {
+                var w = BufferWriter{ .buffer = buffer };
+                w.byte(@intFromEnum(c));
+                w.encode(t);
+            },
+        }
+    }
 };
+
+fn tryEnumFromInt(comptime T: type, value: anytype) ?T {
+    const info = @typeInfo(T).@"enum";
+    inline for (info.fields) |field| {
+        if (field.value == value) {
+            return @field(T, field.name);
+        }
+    }
+    return null;
+}
+
+test tryEnumFromInt {
+    try testing.expectEqual(Kind.pos, tryEnumFromInt(Kind, 0x1));
+    try testing.expectEqual(Kind.ack, tryEnumFromInt(Kind, 0x12));
+    try testing.expectEqual(null, tryEnumFromInt(Kind, 0xff));
+}
 
 test "Pos encode/decode" {
     const p = Control.Pos{
@@ -730,5 +773,156 @@ test "reflection" {
         var r = BufferReader{ .buffer = buffer };
         try r.decodeInto(&p);
         try testing.expectEqualDeep(value, p);
+    }
+}
+
+test "union reflection" {
+    // ako imam broj kako dobiti koji je to type
+    const info = @typeInfo(Control);
+    std.debug.print("tag: {}\n", .{info.@"union".tag_type.?});
+    std.debug.print("fields: {any}\n", .{info.@"union".fields[0]});
+    std.debug.print("fields: {any}\n", .{info.@"union".fields[1]});
+    std.debug.print("decsl: {s}\n", .{info.@"union".decls[0].name});
+
+    const tag_info = @typeInfo(info.@"union".tag_type.?);
+    inline for (tag_info.@"enum".fields) |tag| {
+        std.debug.print("tag: {s} {}\n", .{ tag.name, tag.value });
+        // inline for (info.@"union".fields) |field| {
+        //     if (std.mem.eql(u8, field.name, tag.name))
+        //         field.type;
+        // }
+    }
+
+    std.debug.print("unionFieldType: {any}\n", .{unionFieldType(Control, 1)});
+}
+
+fn unionFieldType(TaggedUnionType: type, tag_value: u8) ?std.builtin.Type.UnionField {
+    const info = @typeInfo(TaggedUnionType);
+    const tag_info = @typeInfo(info.@"union".tag_type.?);
+    inline for (tag_info.@"enum".fields) |tag| {
+        if (tag.value == tag_value) {
+            //std.debug.print("tag: {s} {}\n", .{ tag.name, tag.value });
+            inline for (info.@"union".fields) |field| {
+                if (std.mem.eql(u8, field.name, tag.name))
+                    return field;
+            }
+        }
+    }
+    return null;
+}
+
+test "encode/decode" {
+    const cases: []const struct {
+        value: Control,
+        encoded_bytes: []const u8,
+    } = &.{
+        .{
+            .value = .{ .pos = .{
+                .id = 0xaabbccdd,
+                .name = "stream name",
+                .current = .{
+                    .sequence = 0x1122334455667788,
+                    .timestamp = 0x99aabbccddeeff00,
+                },
+                .tail = .{
+                    .sequence = 0x1122334455667788 + 1,
+                    .timestamp = 0x99aabbccddeeff00 + 1,
+                },
+                .credit = 0xddeeaadd,
+            } },
+            .encoded_bytes = &.{
+                0x1, // kind
+                0xaa, 0xbb, 0xcc, 0xdd, // id
+                0xb, 0x73, 0x74, 0x72, 0x65, 0x61, 0x6d, 0x20, 0x6e, 0x61, 0x6d, 0x65, // name
+                0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, // current.sequence
+                0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x0, // current.timestamp
+                0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x89, // tail.sequence
+                0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x1, // tail timestamp
+                0xdd, 0xee, 0xaa, 0xdd, // credit
+            },
+        },
+        .{
+            .value = .{ .tail = .{
+                .id = 0xaabbccdd,
+                .name = "stream name",
+                .tail = .{
+                    .sequence = 0x1122334455667788 + 1,
+                    .timestamp = 0x99aabbccddeeff00 + 1,
+                },
+            } },
+            .encoded_bytes = &.{
+                0x2, // kind
+                0xaa, 0xbb, 0xcc, 0xdd, // id
+                0xb, 0x73, 0x74, 0x72, 0x65, 0x61, 0x6d, 0x20, 0x6e, 0x61, 0x6d, 0x65, // name
+                0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x89, // tail.sequence
+                0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x1, // tail timestamp
+            },
+        },
+        .{
+            .value = .{ .seek = .{
+                .id = 0xaabbccdd,
+                .sequence = 0x1122334455667788 + 1,
+                .timestamp = 0x99aabbccddeeff00 + 1,
+            } },
+            .encoded_bytes = &.{
+                0x11, // kind
+                0xaa, 0xbb, 0xcc, 0xdd, // id
+                0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x89, // sequence
+                0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x1, // timestamp
+            },
+        },
+        .{
+            .value = .{ .ack = .{
+                .id = 0xaabbccdd,
+                .sequence = 0x1122334455667788 + 1,
+            } },
+            .encoded_bytes = &.{
+                0x12, // kind
+                0xaa, 0xbb, 0xcc, 0xdd, // id
+                0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x89, // sequence
+            },
+        },
+        .{
+            .value = .{ .credit = .{
+                .id = 0xaabbccdd,
+                .credit = 0x11223344,
+            } },
+            .encoded_bytes = &.{
+                0x13, // kind
+                0xaa, 0xbb, 0xcc, 0xdd, // id
+                0x11, 0x22, 0x33, 0x44, // credit
+            },
+        },
+        .{
+            .value = .{ .get_pos = .{
+                .id = 0xaabbccdd,
+            } },
+            .encoded_bytes = &.{
+                0x14, // kind
+                0xaa, 0xbb, 0xcc, 0xdd, // id
+            },
+        },
+        .{
+            .value = .{ .get_tail = .{
+                .name = "stream name",
+            } },
+            .encoded_bytes = &.{
+                0x15, // kind
+                0xb, 0x73, 0x74, 0x72, 0x65, 0x61, 0x6d, 0x20, 0x6e, 0x61, 0x6d, 0x65, // name
+            },
+        },
+    };
+
+    for (cases) |case| {
+        const cmd = case.value;
+
+        const buffer = try testing.allocator.alloc(u8, Control.encodedLength(cmd));
+        defer testing.allocator.free(buffer);
+        try Control.encode(cmd, buffer);
+
+        try testing.expectEqualSlices(u8, case.encoded_bytes, buffer);
+
+        const cmd2 = try Control.decode(buffer);
+        try testing.expectEqualDeep(cmd, cmd2);
     }
 }
