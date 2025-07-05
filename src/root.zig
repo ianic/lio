@@ -56,3 +56,7 @@ pub const UnusedDataBuffer = struct {
         self.buffer = &.{};
     }
 };
+
+pub const broker = struct {
+    pub const command = @import("command.zig");
+};

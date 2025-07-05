@@ -131,6 +131,14 @@ const Connection = struct {
 
         log.debug("onMessage message len {d}", .{msg.payload.len});
         var iter = msg.frames();
+        const cmd_frm = iter.next() orelse return;
+        const cmd = try command.decode(cmd_frm.body);
+        switch (cmd) {
+            .get_tail => |t| {
+                log.debug("get tail for '{s}'", .{t.name});
+            },
+            else => unreachable,
+        }
         while (iter.next()) |frm| {
             log.debug("  frame ({d}): '{s}' '{x}'", .{ frm.len, frm.body, frm.body });
         }
@@ -157,3 +165,5 @@ const Connection = struct {
         self.conn.deinit();
     }
 };
+
+const command = io.broker.command;
